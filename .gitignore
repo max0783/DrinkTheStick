@@ -129,7 +129,6 @@ dist
 .yarn/install-state.gz
 .pnp.*
 users.json
-msc_scrapper_excel.js
 error-screenshot.png
 debug_info.json
 cruceros_msc_partial.xlsx
