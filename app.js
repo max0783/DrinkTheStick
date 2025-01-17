@@ -117,7 +117,7 @@ const checkAndNotifyOffers = async () => {
 };
 
 // Programar verificación cada 30 minutos
-const job = schedule.scheduleJob('*/30 * * * *', checkAndNotifyOffers);
+const job = schedule.scheduleJob('*/15 * * * *', checkAndNotifyOffers);
 
 // Comandos del bot
 bot.onText(/\/start/, async (msg) => {
