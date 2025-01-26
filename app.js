@@ -46,11 +46,11 @@ const checkAndNotifyOffers = async () => {
         // Leer el archivo JSON generado
         const crucerosData = JSON.parse(fs.readFileSync('cruceros_msc.json', 'utf8'));
         
-        // Obtener ofertas actuales menores o iguales a 500
+        // Obtener ofertas actuales menores o iguales a 800
         const currentOffers = crucerosData.cruceros
             .filter(crucero => {
                 const precio = parseInt(crucero.precio.valor);
-                return precio <= 500;
+                return precio <= 800;
             })
             .map(crucero => ({
                 destino: crucero.destino,
@@ -125,7 +125,7 @@ bot.onText(/\/start/, async (msg) => {
     if (!users.includes(chatId)) {
         users.push(chatId);
         saveUsers();
-        bot.sendMessage(chatId, '¡Te has registrado para recibir notificaciones de ofertas de cruceros! Te avisaré cuando encuentre ofertas menores o iguales a $500 USD.');
+        bot.sendMessage(chatId, '¡Te has registrado para recibir notificaciones de ofertas de cruceros! Te avisaré cuando encuentre ofertas menores o iguales a $800 USD.');
         
         // Verificar ofertas inmediatamente
         await checkAndNotifyOffers();
@@ -145,7 +145,7 @@ bot.onText(/\/stop/, (msg) => {
 bot.onText(/\/offers/, async (msg) => {
     const chatId = msg.chat.id;
     if (sentOffers.length > 0) {
-        let message = '📢 Ofertas actuales menores a $500 USD:\n\n';
+        let message = '📢 Ofertas actuales menores a $800 USD:\n\n';
         sentOffers.forEach((offer, index) => {
             message += `${index + 1}. ${offer.destino}\n` +
                       `   💰 Precio: ${offer.precio} ${offer.moneda}\n` +
@@ -155,6 +155,6 @@ bot.onText(/\/offers/, async (msg) => {
         });
         bot.sendMessage(chatId, message);
     } else {
-        bot.sendMessage(chatId, '❌ No hay ofertas activas menores a $500 USD en este momento.');
+        bot.sendMessage(chatId, '❌ No hay ofertas activas menores a $800 USD en este momento.');
     }
 });
