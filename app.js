@@ -116,6 +116,8 @@ const checkAndNotifyOffers = async () => {
     }
 };
 
+checkAndNotifyOffers();
+
 // Programar verificación cada 30 minutos
 const job = schedule.scheduleJob('*/15 * * * *', checkAndNotifyOffers);
 
