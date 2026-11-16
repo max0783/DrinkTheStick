@@ -1,18 +1,20 @@
 {
   "name": "drinkthestick",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "MSC Cruceros automated scraper and Telegram notification bot",
+  "main": "app.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node app.js",
+    "scrape": "node msc_scrapper_excel.js",
+    "test": "node --test"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
     "dotenv": "^16.4.7",
     "exceljs": "^4.4.0",
-    "node-schedule": "^2.1.1",
-    "node-telegram-bot-api": "^0.66.0",
-    "puppeteer": "^23.11.1"
+    "node-schedule": "^2.1.2",
+    "node-telegram-bot-api": "^0.67.0",
+    "puppeteer": "^24.43.1"
   }
 }
