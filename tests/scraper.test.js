@@ -14,10 +14,14 @@ const {
   calculateDepartureDates,
   resolveSearchDates,
   buildSearchUrl,
+  expandFilterCombos,
   discoverPromoLinks,
   parsePrice,
   dismissCookieBanner,
   createExcelReport,
+  navigateWithRetry,
+  isTransientNetworkError,
+  isConnectionRefusedError,
   HEADERS
 } = createFile;
 
@@ -25,6 +29,7 @@ describe('Scraper & Excel Generator (msc_scrapper_excel.js & msc_scrapper.js)', 
   let server;
   let serverUrl;
   let tmpDir;
+  let flakyHits = 0;
 
   before(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dts-scraper-test-'));
@@ -182,6 +187,26 @@ describe('Scraper & Excel Generator (msc_scrapper_excel.js & msc_scrapper.js)', 
           </body>
           </html>
         `);
+      } else if (pathname === '/flaky-once') {
+        flakyHits++;
+        if (flakyHits === 1) {
+          req.socket.destroy();
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+          <body>
+            <div class="cruise-card" data-cruise-id="FLAKY_OK">
+              <p class="description__title">Sudamérica</p>
+              <div class="description" cruise-id="FLAKY_OK"><div class="badge"><span>7 Noches</span></div></div>
+              <span class="ship-name">MSC Armonia</span>
+              <span class="prices__main-price"><span>650 USD</span></span>
+            </div>
+          </body>
+          </html>
+        `);
       } else {
         res.writeHead(404);
         res.end();
@@ -258,6 +283,28 @@ describe('Scraper & Excel Generator (msc_scrapper_excel.js & msc_scrapper.js)', 
       subcategory: 'cyber-week'
     });
     assert.strictEqual(subDynamicSlug, 'https://www.msccruceros.com.ar/ofertas-cruceros/cyber-week');
+
+    const multiArea = buildSearchUrl({ departureDateFrom: '15/11/2026', departureDateTo: '15/05/2028' }, 1, {
+      area: 'SOA,CAR',
+      embkPort: 'BUE,MVD',
+      cabin: 'Vista al mar'
+    });
+    assert.ok(multiArea.includes('area=SOA%2CCAR'));
+    assert.ok(multiArea.includes('embkPort=BUE%2CMVD'));
+    assert.ok(multiArea.includes('cabins=Vista+al+mar') || multiArea.includes('cabins=Vista%20al%20mar'));
+
+    const combos = expandFilterCombos({
+      area: 'SOA,CAR',
+      embkPort: 'BUE,MVD',
+      cabin: 'Interior,Vista al mar',
+      nights: '6-7,8+'
+    });
+    assert.strictEqual(combos.length, 4);
+    assert.strictEqual(combos[0].area, 'SOA,CAR');
+    assert.strictEqual(combos[0].cabin, 'Interior');
+    assert.strictEqual(combos[0].nights, '6-7');
+    assert.strictEqual(combos[3].cabin, 'Vista al mar');
+    assert.strictEqual(combos[3].nights, '8+');
   });
 
   it('parses USD, ARS, EUR and thousand-dot prices into numeric values', () => {
@@ -387,10 +434,51 @@ describe('Scraper & Excel Generator (msc_scrapper_excel.js & msc_scrapper.js)', 
       outputPath: path.join(tmpDir, 'fail.xlsx'),
       jsonPath: path.join(tmpDir, 'fail.json'),
       headless: true,
-      maxPages: 1
+      maxPages: 1,
+      navigationRetries: 1,
+      retryDelayMs: 30
     });
     assert.strictEqual(failRes.success, false);
-    assert.ok(failRes.error);
+    assert.strictEqual(failRes.errorCode, 'ECONNREFUSED');
+    assert.ok(failRes.error.includes('ECONNREFUSED'));
+  });
+
+  it('retries transient ECONNREFUSED / connection resets cleanly before succeeding', async () => {
+    let mockAttempts = 0;
+    const mockPage = {
+      goto: async () => {
+        mockAttempts++;
+        if (mockAttempts < 2) {
+          throw new Error('net::ERR_CONNECTION_REFUSED at https://www.msccruceros.com.ar');
+        }
+        return 'ok';
+      }
+    };
+    assert.strictEqual(isConnectionRefusedError(new Error('connect ECONNREFUSED 127.0.0.1:443')), true);
+    assert.strictEqual(isTransientNetworkError(new Error('net::ERR_CONNECTION_RESET')), true);
+    assert.strictEqual(isTransientNetworkError(new Error('Unexpected token')), false);
+
+    const navRes = await navigateWithRetry(mockPage, 'https://example.test', {
+      navigationRetries: 2,
+      retryDelayMs: 10
+    });
+    assert.strictEqual(navRes, 'ok');
+    assert.strictEqual(mockAttempts, 2);
+
+    // End-to-end Puppeteer retry after dropped connection on /flaky-once
+    flakyHits = 0;
+    const recovered = await createFile({
+      customUrl: `${serverUrl}/flaky-once`,
+      outputPath: path.join(tmpDir, 'recovered.xlsx'),
+      jsonPath: path.join(tmpDir, 'recovered.json'),
+      headless: true,
+      maxPages: 1,
+      navigationRetries: 2,
+      retryDelayMs: 50
+    });
+    assert.strictEqual(recovered.success, true);
+    assert.strictEqual(recovered.totalCruceros, 1);
+    assert.strictEqual(recovered.cruceros[0].barco, 'MSC Armonia');
   });
 
   it('runs msc_scrapper.js CLI and exports expected functions', async () => {
@@ -440,6 +528,28 @@ describe('Scraper & Excel Generator (msc_scrapper_excel.js & msc_scrapper.js)', 
     await wb.xlsx.readFile(outXlsx);
     const ws = wb.getWorksheet('Cruceros MSC');
     assert.strictEqual(ws.getRow(2).getCell(11).value, 'Vista al mar');
+
+    // Multi-cabin direct createFile call expands into combined Excel rows per category
+    const multiXlsx = path.join(tmpDir, 'multi_cabin.xlsx');
+    const multiRes = await createFile({
+      customUrl: `${serverUrl}/filter-demo`,
+      outputPath: multiXlsx,
+      jsonPath: path.join(tmpDir, 'multi_cabin.json'),
+      headless: true,
+      maxPages: 1,
+      filters: {
+        cabin: 'Interior,Vista al mar',
+        nights: '8+'
+      }
+    });
+    assert.strictEqual(multiRes.success, true);
+    assert.strictEqual(multiRes.totalCruceros, 2);
+    assert.deepStrictEqual(multiRes.cruceros.map((c) => c.camarote), ['Interior', 'Vista al mar']);
+    const multiWb = new ExcelJS.Workbook();
+    await multiWb.xlsx.readFile(multiXlsx);
+    const multiWs = multiWb.getWorksheet('Cruceros MSC');
+    assert.strictEqual(multiWs.getRow(2).getCell(11).value, 'Interior');
+    assert.strictEqual(multiWs.getRow(3).getCell(11).value, 'Vista al mar');
   });
 
   it('parses one-way DESDE/HACIA routes cleanly and filters by tripType (roundtrip vs oneway)', async () => {

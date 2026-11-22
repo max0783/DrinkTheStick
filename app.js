@@ -35,7 +35,6 @@ const FILTER_OPTIONS = {
   ports: [
     { code: 'BUE', value: 'BUE', label: '⚓ Buenos Aires' },
     { code: 'MVD', value: 'MVD', label: '⚓ Montevideo' },
-    { code: 'BUE,MVD', value: 'BUE,MVD', label: '⚓ BUE + MVD' },
     { code: 'ALL', value: '', label: '🌐 Cualquiera' }
   ],
   dates: [
@@ -62,9 +61,188 @@ const FILTER_OPTIONS = {
   prices: [600, 800, 1000, 1200, 1500, 2000, 0]
 };
 
+const getOptionValue = (opt) => (opt.value !== undefined ? opt.value : opt.code);
+
+const MULTI_FILTER_META = {
+  sub: {
+    field: 'subcategory',
+    list: FILTER_OPTIONS.subcategories,
+    emptyToast: 'Buscador global',
+    allowSlug: true,
+    extraPatch: {}
+  },
+  area: {
+    field: 'area',
+    list: FILTER_OPTIONS.areas,
+    emptyToast: 'Todos los destinos',
+    allowSlug: false,
+    extraPatch: { subcategory: '' }
+  },
+  port: {
+    field: 'embkPort',
+    list: FILTER_OPTIONS.ports,
+    emptyToast: 'Cualquier salida',
+    allowSlug: false,
+    extraPatch: { subcategory: '' }
+  },
+  cab: {
+    field: 'cabin',
+    list: FILTER_OPTIONS.cabins,
+    emptyToast: 'Todas las cabinas',
+    allowSlug: false,
+    extraPatch: {}
+  },
+  dur: {
+    field: 'nights',
+    list: FILTER_OPTIONS.nights,
+    emptyToast: 'Todas las noches',
+    allowSlug: false,
+    extraPatch: {}
+  }
+};
+
+function parseMultiValues(raw, allowedValues = null, allowSlug = false) {
+  const parts = Array.isArray(raw)
+    ? raw.map((v) => String(v || '').trim())
+    : String(raw || '').split(',').map((v) => v.trim());
+
+  const seen = new Set();
+  const valid = [];
+  for (const val of parts) {
+    if (!val || seen.has(val)) continue;
+    const ok = (!allowedValues && !allowSlug) ||
+      (allowedValues && allowedValues.has(val)) ||
+      (allowSlug && /^[a-z0-9-]+$/i.test(val));
+    if (ok) {
+      seen.add(val);
+      valid.push(val);
+    }
+  }
+
+  if (allowedValues) {
+    const order = Array.from(allowedValues);
+    valid.sort((a, b) => {
+      const ia = order.indexOf(a);
+      const ib = order.indexOf(b);
+      if (ia !== -1 && ib !== -1) return ia - ib;
+      if (ia !== -1) return -1;
+      if (ib !== -1) return 1;
+      return a.localeCompare(b);
+    });
+  }
+  return valid;
+}
+
+function toggleMultiValue(currentCsv, value, allowedValues = null, allowSlug = false) {
+  const list = parseMultiValues(currentCsv, allowedValues, allowSlug);
+  const idx = list.indexOf(value);
+  if (idx >= 0) {
+    list.splice(idx, 1);
+  } else {
+    list.push(value);
+  }
+  return parseMultiValues(list, allowedValues, allowSlug).join(',');
+}
+
 let isJobRunning = false;
 let scheduledJob = null;
 let bot = null;
+let activeLockPath = null;
+let pollingRestartTimer = null;
+
+const DEFAULT_POLLING_BACKOFF_MS = [2000, 5000, 15000, 30000, 60000];
+
+function buildBotOptions(options = {}) {
+  return {
+    polling: options.polling !== undefined ? options.polling : true,
+    request: {
+      family: 4,
+      ...(options.request || {})
+    }
+  };
+}
+
+function isTransientTelegramError(err) {
+  if (!err) return false;
+  const status = err?.response?.statusCode;
+  if (status === 429 || (status >= 500 && status < 600)) return true;
+  if (status && status >= 400 && status < 500) return false;
+
+  const code = String(err.code || '').toUpperCase();
+  const msg = String(err.message || err || '');
+  if (['EFATAL', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN', 'EPIPE'].includes(code)) {
+    return true;
+  }
+  return /ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|429 Too Many Requests|502 Bad Gateway|503 Service|504 Gateway Timeout|socket hang up/i.test(msg);
+}
+
+function extractRetryAfterMs(err) {
+  const headerVal = Number(err?.response?.headers?.['retry-after']);
+  if (Number.isFinite(headerVal) && headerVal > 0) return (headerVal + 1) * 1000;
+  const match = String(err?.message || '').match(/retry after\s+(\d+)/i);
+  if (match) return (Number(match[1]) + 1) * 1000;
+  return 0;
+}
+
+async function callTelegramWithRetry(fn, opts = {}) {
+  const maxRetries = Number.isInteger(opts.maxRetries) ? opts.maxRetries : 2;
+  const baseDelayMs = Number(opts.delayMs) >= 0 ? Number(opts.delayMs) : 800;
+
+  let lastErr;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientTelegramError(err) || attempt >= maxRetries) {
+        throw err;
+      }
+      const retryAfter = extractRetryAfterMs(err);
+      const delayMs = retryAfter > 0 ? retryAfter : baseDelayMs * Math.pow(2, attempt);
+      if (delayMs > 0) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+function getLockFilePath(overridePath) {
+  return path.resolve(overridePath || path.join(process.cwd(), 'drinkthestick.pid'));
+}
+
+function acquireInstanceLock(overridePath) {
+  const lockPath = getLockFilePath(overridePath);
+  if (fs.existsSync(lockPath)) {
+    const rawPid = Number(String(fs.readFileSync(lockPath, 'utf8') || '').trim());
+    if (Number.isInteger(rawPid) && rawPid > 0 && rawPid !== process.pid) {
+      try {
+        process.kill(rawPid, 0);
+        return { acquired: false, existingPid: rawPid, lockPath };
+      } catch (err) {
+        if (err && err.code === 'EPERM') {
+          return { acquired: false, existingPid: rawPid, lockPath };
+        }
+        // Stale PID (ESRCH): safe to take over lock
+      }
+    }
+  }
+  fs.writeFileSync(lockPath, String(process.pid), 'utf8');
+  return { acquired: true, pid: process.pid, lockPath };
+}
+
+function releaseInstanceLock(overridePath) {
+  const lockPath = getLockFilePath(overridePath || activeLockPath);
+  try {
+    if (fs.existsSync(lockPath)) {
+      const pidInFile = Number(String(fs.readFileSync(lockPath, 'utf8') || '').trim());
+      if (!pidInFile || pidInFile === process.pid) {
+        fs.unlinkSync(lockPath);
+      }
+    }
+  } catch (_) {}
+  if (!overridePath) activeLockPath = null;
+}
 
 function getUsersFilePath(overridePath) {
   return path.resolve(overridePath || path.join(process.cwd(), 'users.json'));
@@ -99,23 +277,26 @@ function normalizeFilters(raw = {}, overrideMaxPrice) {
   const defaults = getDefaultFilters(overrideMaxPrice);
   const src = raw && typeof raw === 'object' ? raw : {};
 
-  const validSubcategories = new Set(FILTER_OPTIONS.subcategories.map((s) => s.value));
-  const validTripTypes = new Set(FILTER_OPTIONS.tripTypes.map((t) => t.value));
-  const validAreas = new Set(['SOA', 'CAR', 'MED', '']);
-  const validPorts = new Set(['BUE', 'MVD', 'BUE,MVD', '']);
+  const validSubcategories = new Set(FILTER_OPTIONS.subcategories.map(getOptionValue).filter(Boolean));
+  const validTripTypes = new Set(FILTER_OPTIONS.tripTypes.map(getOptionValue));
+  const validAreas = new Set(FILTER_OPTIONS.areas.map(getOptionValue).filter(Boolean));
+  const validPorts = new Set(FILTER_OPTIONS.ports.map(getOptionValue).filter(Boolean));
   const validDates = new Set(['6m', '12m', '18m', 'summer', 'custom']);
-  const validCabins = new Set(FILTER_OPTIONS.cabins.map((c) => c.value));
-  const validNights = new Set(FILTER_OPTIONS.nights.map((n) => n.value));
+  const validCabins = new Set(FILTER_OPTIONS.cabins.map(getOptionValue).filter(Boolean));
+  const validNights = new Set(FILTER_OPTIONS.nights.map(getOptionValue).filter(Boolean));
 
-  const subRaw = src.subcategory !== undefined ? String(src.subcategory).trim() : '';
-  const subcategory = src.subcategory !== undefined && (validSubcategories.has(subRaw) || /^[a-z0-9-]+$/i.test(subRaw))
-    ? subRaw
+  const subcategory = src.subcategory !== undefined
+    ? parseMultiValues(src.subcategory, validSubcategories, true).join(',')
     : defaults.subcategory;
   const tripType = src.tripType !== undefined && validTripTypes.has(String(src.tripType))
     ? String(src.tripType)
     : defaults.tripType;
-  const area = src.area !== undefined && validAreas.has(String(src.area)) ? String(src.area) : defaults.area;
-  const embkPort = src.embkPort !== undefined && validPorts.has(String(src.embkPort)) ? String(src.embkPort) : defaults.embkPort;
+  const area = src.area !== undefined
+    ? parseMultiValues(src.area, validAreas).join(',')
+    : defaults.area;
+  const embkPort = src.embkPort !== undefined
+    ? parseMultiValues(src.embkPort, validPorts).join(',')
+    : defaults.embkPort;
   let datePreset = src.datePreset !== undefined && validDates.has(String(src.datePreset)) ? String(src.datePreset) : defaults.datePreset;
   let dateFrom = typeof src.dateFrom === 'string' ? src.dateFrom.trim() : '';
   let dateTo = typeof src.dateTo === 'string' ? src.dateTo.trim() : '';
@@ -129,8 +310,12 @@ function normalizeFilters(raw = {}, overrideMaxPrice) {
     dateTo = '';
   }
 
-  const cabin = src.cabin !== undefined && validCabins.has(String(src.cabin)) ? String(src.cabin) : defaults.cabin;
-  const nights = src.nights !== undefined && validNights.has(String(src.nights)) ? String(src.nights) : defaults.nights;
+  const cabin = src.cabin !== undefined
+    ? parseMultiValues(src.cabin, validCabins).join(',')
+    : defaults.cabin;
+  const nights = src.nights !== undefined
+    ? parseMultiValues(src.nights, validNights).join(',')
+    : defaults.nights;
 
   let maxPrice = defaults.maxPrice;
   if (src.maxPrice === 0 || src.maxPrice === '0') {
@@ -142,12 +327,33 @@ function normalizeFilters(raw = {}, overrideMaxPrice) {
     }
   }
 
-  return { subcategory, tripType, area, embkPort, datePreset, dateFrom, dateTo, cabin, nights, maxPrice };
+  return {
+    subcategory,
+    tripType,
+    area,
+    embkPort,
+    datePreset,
+    dateFrom,
+    dateTo,
+    cabin,
+    nights,
+    maxPrice
+  };
 }
 
 function getSearchFilterKey(filters) {
   const f = normalizeFilters(filters);
-  return [f.subcategory, f.tripType, f.area, f.embkPort, f.datePreset, f.dateFrom, f.dateTo, f.cabin, f.nights].join('|');
+  return [
+    f.subcategory,
+    f.tripType,
+    f.area,
+    f.embkPort,
+    f.datePreset,
+    f.dateFrom,
+    f.dateTo,
+    f.cabin,
+    f.nights
+  ].join('|');
 }
 
 function loadJsonArray(filePath) {
@@ -163,9 +369,15 @@ function loadJsonArray(filePath) {
 }
 
 function saveJsonArray(filePath, data) {
+  const tmpPath = `${filePath}.tmp.${process.pid}`;
   try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tmpPath, filePath);
   } catch (err) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch (_) {}
     console.error(`[Storage] Error writing ${filePath}:`, err.message);
   }
 }
@@ -268,39 +480,82 @@ function getOfferDatesText(offer) {
   return String(offer?.fechas || '');
 }
 
+function extractCruiseId(offerOrUrl) {
+  if (offerOrUrl && typeof offerOrUrl === 'object') {
+    if (offerOrUrl.cruiseId) return String(offerOrUrl.cruiseId).trim();
+    const candidateUrl = offerOrUrl.url || offerOrUrl.url_itinerario || '';
+    return extractCruiseId(candidateUrl);
+  }
+  const urlStr = String(offerOrUrl || '').trim();
+  if (!urlStr) return '';
+  const match = urlStr.match(/[?&]cruiseId=([^&#]+)/i);
+  if (!match) return '';
+  try {
+    return decodeURIComponent(match[1]).trim();
+  } catch (_) {
+    return match[1].trim();
+  }
+}
+
 function normalizeItineraryUrl(rawUrl) {
   const urlStr = String(rawUrl || '').trim();
   if (!urlStr) return '';
 
-  const match = urlStr.match(/[?&]cruiseId=([^&#]+)/i);
-  if (match) {
-    let cruiseId = match[1];
-    try {
-      cruiseId = decodeURIComponent(cruiseId);
-    } catch (_) {
-      // Keep raw value if malformed URI sequence
-    }
-    if (!/\/booking\b/i.test(urlStr)) {
-      return `https://www.msccruceros.com.ar/booking?cruiseId=${encodeURIComponent(cruiseId)}&adults=2&children=0&infants=0&juniors=0`;
-    }
+  const cruiseId = extractCruiseId(urlStr);
+  if (cruiseId && !/\/booking\b/i.test(urlStr)) {
+    return `https://www.msccruceros.com.ar/booking?cruiseId=${encodeURIComponent(cruiseId)}&adults=2&children=0&infants=0&juniors=0`;
   }
   return urlStr;
 }
 
-function isSameOffer(a, b) {
+function isSameCruiseVariant(a, b) {
+  if (String(a?.camarote || 'Todas') !== String(b?.camarote || 'Todas')) return false;
+
+  const idA = extractCruiseId(a);
+  const idB = extractCruiseId(b);
+  if (idA && idB) {
+    return idA === idB;
+  }
+
   return (
-    a.destino === b.destino &&
-    getOfferPrice(a) === getOfferPrice(b) &&
-    String(a.barco) === String(b.barco) &&
-    getOfferDatesText(a) === getOfferDatesText(b) &&
-    String(a.camarote || 'Todas') === String(b.camarote || 'Todas')
+    String(a?.destino || '') === String(b?.destino || '') &&
+    String(a?.barco || '') === String(b?.barco || '') &&
+    getOfferDatesText(a) === getOfferDatesText(b)
   );
 }
 
+function isSameOffer(a, b) {
+  return isSameCruiseVariant(a, b) && getOfferPrice(a) === getOfferPrice(b);
+}
+
+function isChatIdInList(chatIds, chatId) {
+  return Array.isArray(chatIds)
+    ? chatIds.some((id) => String(id) === String(chatId))
+    : true;
+}
+
+function hasAlreadyNotifiedUser(sentOffers, offer, chatId) {
+  const candidatePrice = getOfferPrice(offer);
+  return sentOffers.some((so) => {
+    if (!isSameCruiseVariant(so, offer)) return false;
+    if (!isChatIdInList(so.chatIds, chatId)) return false;
+    const sentPrice = getOfferPrice(so);
+    return Number.isFinite(sentPrice) && Number.isFinite(candidatePrice)
+      ? sentPrice <= candidatePrice
+      : isSameOffer(so, offer);
+  });
+}
+
 function findFilterLabel(list, value) {
-  const found = list.find((item) => (item.value !== undefined ? item.value : item.code) === value);
+  const found = list.find((item) => getOptionValue(item) === value);
   if (found) return found.label;
   return value ? `🏷 ${value}` : '';
+}
+
+function formatMultiFilterLabel(list, csvValue) {
+  const values = parseMultiValues(csvValue, null, true);
+  if (values.length === 0) return findFilterLabel(list, '');
+  return values.map((val) => findFilterLabel(list, val)).join(', ');
 }
 
 function formatPriceFilterLabel(maxPrice) {
@@ -318,32 +573,35 @@ function formatFilterSummary(filters) {
   const f = normalizeFilters(filters);
   const areaLine = f.subcategory
     ? '• Destino / Salida: (catálogo de subcategoría)'
-    : `• Destino: ${findFilterLabel(FILTER_OPTIONS.areas, f.area)}\n• Salida: ${findFilterLabel(FILTER_OPTIONS.ports, f.embkPort)}`;
+    : `• Destino: ${formatMultiFilterLabel(FILTER_OPTIONS.areas, f.area)}\n• Salida: ${formatMultiFilterLabel(FILTER_OPTIONS.ports, f.embkPort)}`;
 
   return (
     `🎛 Tus filtros actuales:\n` +
-    `• Subcategoría: ${findFilterLabel(FILTER_OPTIONS.subcategories, f.subcategory)}\n` +
+    `• Subcategoría: ${formatMultiFilterLabel(FILTER_OPTIONS.subcategories, f.subcategory)}\n` +
     `• Tipo de viaje: ${findFilterLabel(FILTER_OPTIONS.tripTypes, f.tripType)}\n` +
     `${areaLine}\n` +
     `• Fechas: ${formatDatesFilterLabel(f)}\n` +
-    `• Camarote: ${findFilterLabel(FILTER_OPTIONS.cabins, f.cabin)}\n` +
-    `• Noches: ${findFilterLabel(FILTER_OPTIONS.nights, f.nights)}\n` +
+    `• Camarote: ${formatMultiFilterLabel(FILTER_OPTIONS.cabins, f.cabin)}\n` +
+    `• Noches: ${formatMultiFilterLabel(FILTER_OPTIONS.nights, f.nights)}\n` +
     `• Precio máx.: ${formatPriceFilterLabel(f.maxPrice)}`
   );
 }
 
 function formatShortFilterCaption(filters) {
   const f = normalizeFilters(filters);
-  const subLabel = findFilterLabel(FILTER_OPTIONS.subcategories, f.subcategory).replace(/^[^\s]+\s/, '');
+  const stripIcon = (txt) => txt.replace(/^[^\s]+\s/, '');
+  const subLabel = parseMultiValues(f.subcategory, null, true)
+    .map((v) => stripIcon(findFilterLabel(FILTER_OPTIONS.subcategories, v)))
+    .join(', ') || 'Buscador global';
   const scopeParts = f.subcategory
     ? [subLabel]
     : [
-        findFilterLabel(FILTER_OPTIONS.areas, f.area).replace(/^[^\s]+\s/, ''),
-        findFilterLabel(FILTER_OPTIONS.ports, f.embkPort).replace(/^[^\s]+\s/, '')
+        parseMultiValues(f.area).map((v) => stripIcon(findFilterLabel(FILTER_OPTIONS.areas, v))).join(', ') || 'Todos',
+        parseMultiValues(f.embkPort).map((v) => stripIcon(findFilterLabel(FILTER_OPTIONS.ports, v))).join(', ') || 'Cualquiera'
       ];
   const parts = [
     ...scopeParts,
-    f.tripType ? findFilterLabel(FILTER_OPTIONS.tripTypes, f.tripType).replace(/^[^\s]+\s/, '') : 'Ida/Vuelta y Solo ida',
+    f.tripType ? stripIcon(findFilterLabel(FILTER_OPTIONS.tripTypes, f.tripType)) : 'Ida/Vuelta y Solo ida',
     f.cabin || 'Todas las cabinas',
     f.nights ? `${f.nights} noches` : 'Cualquier duración'
   ];
@@ -362,18 +620,20 @@ function buildFilterKeyboard(filters, submenu = 'main') {
   const f = normalizeFilters(filters);
   const btn = (text, callback_data) => ({ text, callback_data });
 
-  if (submenu === 'sub') {
-    const items = FILTER_OPTIONS.subcategories.map((opt) => {
-      const prefix = f.subcategory === opt.value ? '✅ ' : '';
-      return btn(`${prefix}${opt.label}`, `flt:sub:${opt.code}`);
+  if (MULTI_FILTER_META[submenu]) {
+    const meta = MULTI_FILTER_META[submenu];
+    const selected = new Set(parseMultiValues(f[meta.field], null, Boolean(meta.allowSlug)));
+    const items = meta.list.map((opt) => {
+      const val = getOptionValue(opt);
+      const isChecked = val === '' ? selected.size === 0 : selected.has(val);
+      return btn(`${isChecked ? '✅ ' : ''}${opt.label}`, `flt:${submenu}:${opt.code}`);
     });
-    return {
-      inline_keyboard: [
-        ...chunkButtons(items, 2),
-        [btn('🔍 Buscar sublinks de promos', 'flt:discover')],
-        [btn('⬅️ Volver', 'flt:menu')]
-      ]
-    };
+    const rows = chunkButtons(items, 2);
+    if (submenu === 'sub') {
+      rows.push([btn('🔍 Buscar sublinks de promos', 'flt:discover')]);
+    }
+    rows.push([btn('⬅️ Volver', 'flt:menu')]);
+    return { inline_keyboard: rows };
   }
 
   if (submenu === 'trip') {
@@ -384,43 +644,10 @@ function buildFilterKeyboard(filters, submenu = 'main') {
     return { inline_keyboard: [...chunkButtons(items, 2), [btn('⬅️ Volver', 'flt:menu')]] };
   }
 
-  if (submenu === 'area') {
-    const items = FILTER_OPTIONS.areas.map((opt) => {
-      const val = opt.value !== undefined ? opt.value : opt.code;
-      const prefix = f.area === val ? '✅ ' : '';
-      return btn(`${prefix}${opt.label}`, `flt:area:${opt.code}`);
-    });
-    return { inline_keyboard: [...chunkButtons(items, 2), [btn('⬅️ Volver', 'flt:menu')]] };
-  }
-
-  if (submenu === 'port') {
-    const items = FILTER_OPTIONS.ports.map((opt) => {
-      const prefix = f.embkPort === opt.value ? '✅ ' : '';
-      return btn(`${prefix}${opt.label}`, `flt:port:${opt.code}`);
-    });
-    return { inline_keyboard: [...chunkButtons(items, 2), [btn('⬅️ Volver', 'flt:menu')]] };
-  }
-
   if (submenu === 'date') {
     const items = FILTER_OPTIONS.dates.map((opt) => {
       const prefix = f.datePreset === opt.code ? '✅ ' : '';
       return btn(`${prefix}${opt.label}`, `flt:date:${opt.code}`);
-    });
-    return { inline_keyboard: [...chunkButtons(items, 2), [btn('⬅️ Volver', 'flt:menu')]] };
-  }
-
-  if (submenu === 'cab') {
-    const items = FILTER_OPTIONS.cabins.map((opt) => {
-      const prefix = f.cabin === opt.value ? '✅ ' : '';
-      return btn(`${prefix}${opt.label}`, `flt:cab:${opt.code}`);
-    });
-    return { inline_keyboard: [...chunkButtons(items, 2), [btn('⬅️ Volver', 'flt:menu')]] };
-  }
-
-  if (submenu === 'dur') {
-    const items = FILTER_OPTIONS.nights.map((opt) => {
-      const prefix = f.nights === opt.value ? '✅ ' : '';
-      return btn(`${prefix}${opt.label}`, `flt:dur:${opt.code}`);
     });
     return { inline_keyboard: [...chunkButtons(items, 2), [btn('⬅️ Volver', 'flt:menu')]] };
   }
@@ -520,9 +747,11 @@ async function runReportCycle(options = {}) {
             : rec.filters
         }));
 
-    // Group targets by identical scrape parameters so shared filters run only once
+    // Expand multi-value filters into shared atomic scrape specs
     const groupsMap = new Map();
     const hasCustomUrl = Boolean(options.scraperOptions && options.scraperOptions.customUrl);
+    const hasFilterOverrideInScraperOpts = Boolean(options.scraperOptions && options.scraperOptions.filters);
+    const memberRunState = new Map();
 
     if (targets.length === 0) {
       groupsMap.set('default', {
@@ -531,11 +760,27 @@ async function runReportCycle(options = {}) {
       });
     } else {
       for (const target of targets) {
-        const key = hasCustomUrl ? '__CUSTOM__' : getSearchFilterKey(target.filters);
-        if (!groupsMap.has(key)) {
-          groupsMap.set(key, { filters: target.filters, members: [] });
+        memberRunState.set(String(target.chatId), {
+          member: target,
+          totalCruceros: 0,
+          rawCruises: [],
+          matchingOffers: [],
+          newOffersCount: 0,
+          groupXlsxPaths: []
+        });
+        const specs = (hasCustomUrl || hasFilterOverrideInScraperOpts)
+          ? [target.filters]
+          : createFile.expandFilterCombos(target.filters);
+        for (const spec of specs) {
+          const key = hasCustomUrl ? '__CUSTOM__' : getSearchFilterKey(spec);
+          if (!groupsMap.has(key)) {
+            groupsMap.set(key, { filters: spec, members: [] });
+          }
+          const grp = groupsMap.get(key);
+          if (!grp.members.some((m) => String(m.chatId) === String(target.chatId))) {
+            grp.members.push(target);
+          }
         }
-        groupsMap.get(key).members.push(target);
       }
     }
 
@@ -568,7 +813,9 @@ async function runReportCycle(options = {}) {
 
       const scrapeResult = await scraper(scraperOpts);
       if (!scrapeResult || scrapeResult.success === false) {
-        throw new Error((scrapeResult && scrapeResult.error) || 'Scraping failed');
+        const err = new Error((scrapeResult && scrapeResult.error) || 'Scraping failed');
+        err.code = scrapeResult?.errorCode || 'SCRAPE_ERROR';
+        throw err;
       }
 
       const xlsxPath = scrapeResult.xlsxPath || path.resolve(process.cwd(), 'cruceros_msc.xlsx');
@@ -580,64 +827,77 @@ async function runReportCycle(options = {}) {
       totalCruceros += scrapeResult.totalCruceros || 0;
 
       const cruceros = Array.isArray(scrapeResult.cruceros) ? scrapeResult.cruceros : [];
-      const mappedOffers = cruceros.map((c) => ({
+      const fallbackCabin = group.filters.cabin || 'Todas';
+      const normalizedCruises = cruceros.map((c) => ({
+        ...c,
+        camarote: c.camarote || fallbackCabin,
+        url_itinerario: normalizeItineraryUrl(c.url_itinerario || c.url || '')
+      }));
+      const rawMappedOffers = normalizedCruises.map((c) => ({
         destino: c.destino,
         duracion: c.duracion,
         barco: c.barco,
         precio: getOfferPrice(c),
         moneda: c.precio?.moneda || 'USD',
         fechas: getOfferDatesText(c),
-        url: normalizeItineraryUrl(c.url_itinerario || c.url || ''),
+        url: c.url_itinerario,
+        cruiseId: extractCruiseId(c.url_itinerario) || c.cruiseId || '',
         puerto: c.puerto_salida || c.puerto || 'No especificado',
-        camarote: c.camarote || group.filters.cabin || 'Todas',
+        camarote: c.camarote,
         page: c.pagina || 1
       }));
+      const mappedOffers = [];
+      for (const candidate of rawMappedOffers) {
+        if (!mappedOffers.some((existing) => isSameOffer(existing, candidate))) {
+          mappedOffers.push(candidate);
+        }
+      }
 
       activeBroadcastOffers.push(...mappedOffers);
 
       if (!currentBot || group.members.length === 0) continue;
 
-      const todayStr = new Date().toLocaleDateString('es-AR', {
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric'
-      });
-      const fileOptions = options.fileOptions || {
-        filename: `cruceros_msc_${new Date().toISOString().slice(0, 10)}.xlsx`,
-        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-      };
+      // Reload latest persisted notification state after potentially long scrape
+      sentOffers = loadSentOffers(offersPath);
+      const nowIso = new Date().toISOString();
 
       for (const member of group.members) {
         const chatId = member.chatId;
         const maxPrice = member.filters.maxPrice;
+        const state = memberRunState.get(String(chatId));
         const matchingOffers = maxPrice > 0
           ? mappedOffers.filter((o) => Number.isFinite(o.precio) && o.precio > 0 && o.precio <= maxPrice)
           : [];
 
-        if (typeof currentBot.sendDocument === 'function' && options.sendDocument === true) {
-          const budgetLine = maxPrice > 0
-            ? `\n💰 Con precio ≤ $${maxPrice} USD: ${matchingOffers.length}`
-            : '';
-          const caption = options.caption ||
-            `📊 Reporte MSC Cruceros - ${todayStr}\n🎛 ${formatShortFilterCaption(member.filters)}\n🚢 Total encontrados: ${scrapeResult.totalCruceros || 0}${budgetLine}`;
-
-          try {
-            await currentBot.sendDocument(chatId, xlsxPath, { caption }, fileOptions);
-            documentsSent++;
-          } catch (err) {
-            console.error(`[ReportCycle] Error sending Excel to chat ${chatId}:`, err.message);
+        if (state) {
+          state.totalCruceros += scrapeResult.totalCruceros || 0;
+          state.groupXlsxPaths.push(xlsxPath);
+          for (const nc of normalizedCruises) {
+            const candidate = { ...nc, precio: getOfferPrice(nc) };
+            if (!state.rawCruises.some((ex) => isSameOffer({ ...ex, precio: getOfferPrice(ex) }, candidate))) {
+              state.rawCruises.push(nc);
+            }
+          }
+          for (const mo of matchingOffers) {
+            if (!state.matchingOffers.some((ex) => isSameOffer(ex, mo))) {
+              state.matchingOffers.push(mo);
+            }
           }
         }
 
-        let userNewOffersCount = 0;
         if (options.sendOffers !== false && typeof currentBot.sendMessage === 'function' && maxPrice > 0) {
           for (const offer of matchingOffers) {
             const existing = sentOffers.find((so) => isSameOffer(so, offer));
-            const alreadySentToUser = existing
-              ? (Array.isArray(existing.chatIds) ? existing.chatIds.includes(chatId) : true)
-              : false;
+            const alreadyNotified = hasAlreadyNotifiedUser(sentOffers, offer, chatId);
 
-            if (alreadySentToUser) continue;
+            if (alreadyNotified) {
+              if (existing) {
+                existing.active = true;
+                existing.lastSeenAt = nowIso;
+                existing.url = offer.url || existing.url;
+              }
+              continue;
+            }
 
             const msg =
               `¡Nueva oferta encontrada!\n\n` +
@@ -651,43 +911,112 @@ async function runReportCycle(options = {}) {
               `🔗 Ver más: ${offer.url}`;
 
             try {
-              await currentBot.sendMessage(chatId, msg);
+              await callTelegramWithRetry(
+                () => currentBot.sendMessage(chatId, msg),
+                { delayMs: options.telegramRetryDelayMs }
+              );
               offersSent++;
-              userNewOffersCount++;
+              if (state) state.newOffersCount++;
 
               if (existing) {
                 if (!Array.isArray(existing.chatIds)) existing.chatIds = [];
-                if (!existing.chatIds.includes(chatId)) existing.chatIds.push(chatId);
+                if (!isChatIdInList(existing.chatIds, chatId)) existing.chatIds.push(chatId);
+                existing.active = true;
+                existing.lastSeenAt = nowIso;
+                existing.url = offer.url || existing.url;
               } else {
-                sentOffers.push({ ...offer, chatIds: [chatId] });
+                sentOffers.push({
+                  ...offer,
+                  active: true,
+                  lastSeenAt: nowIso,
+                  chatIds: [chatId]
+                });
               }
+              saveSentOffers(sentOffers, offersPath);
             } catch (err) {
               console.error(`[ReportCycle] Error sending offer to chat ${chatId}:`, err.message);
             }
           }
         }
+      }
+    }
 
-        if (options.notifyManualSummary && typeof currentBot.sendMessage === 'function' && userNewOffersCount === 0) {
+    // Deliver consolidated Excel (one combined file even when 2+ cabins/subcategories ran) and manual summary
+    if (currentBot && memberRunState.size > 0) {
+      const todayStr = new Date().toLocaleDateString('es-AR', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric'
+      });
+      const fileOptions = options.fileOptions || {
+        filename: `cruceros_msc_${new Date().toISOString().slice(0, 10)}.xlsx`,
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      };
+
+      for (const state of memberRunState.values()) {
+        const chatId = state.member.chatId;
+        const maxPrice = state.member.filters.maxPrice;
+
+        if (typeof currentBot.sendDocument === 'function' && options.sendDocument === true) {
+          let docPath = state.groupXlsxPaths[0] || lastXlsxPath;
+          if (state.groupXlsxPaths.length > 1) {
+            const mergedPath = path.join(os.tmpdir(), `dts_merged_${chatId}_${Date.now()}.xlsx`);
+            await createFile.createExcelReport(state.rawCruises, mergedPath);
+            tempFilesToClean.push(mergedPath);
+            docPath = mergedPath;
+          }
+          const reportCount = state.groupXlsxPaths.length > 1 ? state.rawCruises.length : state.totalCruceros;
+          const budgetLine = maxPrice > 0
+            ? `\n💰 Con precio ≤ $${maxPrice} USD: ${state.matchingOffers.length}`
+            : '';
+          const caption = options.caption ||
+            `📊 Reporte MSC Cruceros - ${todayStr}\n🎛 ${formatShortFilterCaption(state.member.filters)}\n🚢 Total encontrados: ${reportCount}${budgetLine}`;
+
+          try {
+            await callTelegramWithRetry(
+              () => currentBot.sendDocument(chatId, docPath, { caption }, fileOptions),
+              { delayMs: options.telegramRetryDelayMs }
+            );
+            documentsSent++;
+          } catch (err) {
+            console.error(`[ReportCycle] Error sending Excel to chat ${chatId}:`, err.message);
+          }
+        }
+
+        if (options.notifyManualSummary && typeof currentBot.sendMessage === 'function' && state.newOffersCount === 0) {
           const infoMsg = maxPrice > 0
-            ? (matchingOffers.length === 0
-                ? `ℹ️ Búsqueda finalizada: ${scrapeResult.totalCruceros || 0} cruceros encontrados, pero ninguno por debajo de USD ${maxPrice}. Revisa el Excel o ajusta el precio en /filtros.`
-                : `ℹ️ Búsqueda finalizada: ${matchingOffers.length} ofertas ≤ USD ${maxPrice} (ya te las había enviado antes; mira el Excel actualizado arriba).`)
-            : `ℹ️ Búsqueda finalizada: ${scrapeResult.totalCruceros || 0} cruceros cargados en el Excel (tenés Precio máx. en "Sin límite").`;
-          await currentBot.sendMessage(chatId, infoMsg).catch(() => {});
+            ? (state.matchingOffers.length === 0
+                ? `ℹ️ Búsqueda finalizada: ${state.totalCruceros} cruceros encontrados, pero ninguno por debajo de USD ${maxPrice}. Revisa el Excel o ajusta el precio en /filtros.`
+                : `ℹ️ Búsqueda finalizada: ${state.matchingOffers.length} ofertas ≤ USD ${maxPrice} (ya te las había enviado antes; mira el Excel actualizado arriba).`)
+            : `ℹ️ Búsqueda finalizada: ${state.totalCruceros} cruceros cargados en el Excel (tenés Precio máx. en "Sin límite").`;
+          await callTelegramWithRetry(
+            () => currentBot.sendMessage(chatId, infoMsg),
+            { delayMs: options.telegramRetryDelayMs }
+          ).catch(() => {});
         }
       }
     }
 
-    // In full broadcast runs, prune offers that are no longer active under any group
-    if (!isTargetedRun && activeBroadcastOffers.length >= 0 && targets.length > 0 && options.sendOffers !== false) {
-      const anyMaxPrice = Math.max(0, ...targets.map((t) => Number(t.filters.maxPrice) || 0));
-      sentOffers = sentOffers.filter((so) =>
-        activeBroadcastOffers.some((co) =>
-          isSameOffer(co, so) && (anyMaxPrice === 0 || getOfferPrice(co) <= anyMaxPrice)
-        )
-      );
-      saveSentOffers(sentOffers, offersPath);
-    } else if (targets.length > 0 && options.sendOffers !== false) {
+    // Update active state on full broadcast runs that returned results WITHOUT deleting history
+    if (!isTargetedRun && totalCruceros > 0 && activeBroadcastOffers.length > 0 && options.sendOffers !== false) {
+      const syncTime = new Date().toISOString();
+      sentOffers = loadSentOffers(offersPath).map((so) => {
+        const matched = activeBroadcastOffers.find((co) => isSameOffer(co, so));
+        if (matched) {
+          return {
+            ...so,
+            cruiseId: so.cruiseId || matched.cruiseId || extractCruiseId(matched),
+            url: matched.url || normalizeItineraryUrl(so.url || ''),
+            active: true,
+            lastSeenAt: syncTime
+          };
+        }
+        return {
+          ...so,
+          cruiseId: so.cruiseId || extractCruiseId(so),
+          active: false
+        };
+      });
       saveSentOffers(sentOffers, offersPath);
     }
 
@@ -703,6 +1032,7 @@ async function runReportCycle(options = {}) {
     console.error('[ReportCycle Error]:', error.message);
     return {
       success: false,
+      errorCode: error.code || (createFile.isConnectionRefusedError(error) ? 'ECONNREFUSED' : 'CYCLE_ERROR'),
       error: error.message
     };
   } finally {
@@ -768,13 +1098,13 @@ async function safeEditMessage(botInstance, chatId, messageId, text, replyMarkup
 
 const SUBMENU_TITLES = {
   main: '⚙️ Configuración de filtros MSC Cruceros',
-  sub: '🏷 Elige subcategoría o promoción de MSC (o Buscador global para usar Destino y Salida):',
+  sub: '🏷 Elige una o más subcategorías / promos (o Buscador global para usar Destino y Salida):',
   trip: '🔁 Selecciona tipo de itinerario (Ida y vuelta vs Solo ida):',
-  area: '🗺 Selecciona el destino (hacia):',
-  port: '⚓ Selecciona puerto de salida (desde):',
+  area: '🗺 Destinos (hacia) — puedes elegir dos o más:',
+  port: '⚓ Puertos de salida (desde) — puedes elegir uno o ambos:',
   date: '📅 Selecciona rango de fechas:',
-  cab: '🛏 Selecciona categoría de camarote:',
-  dur: '🌙 Selecciona duración en noches:',
+  cab: '🛏 Categorías de camarote — puedes elegir dos o más:',
+  dur: '🌙 Duración en noches — puedes elegir dos o más:',
   prc: '💰 Selecciona precio máximo para alertas (USD):'
 };
 
@@ -805,12 +1135,12 @@ function registerBotHandlers(botInstance, options = {}) {
     }
 
     discoveredPromos = res.links.slice(0, 20);
-    const currentSub = getUserFilters(chatId, usersPath).subcategory;
+    const currentSubs = new Set(parseMultiValues(getUserFilters(chatId, usersPath).subcategory, null, true));
 
     let text = `🏷 Sublinks de promociones encontrados en MSC (${discoveredPromos.length}):\n\n`;
     const promoButtons = discoveredPromos.map((item, idx) => {
       text += `${idx + 1}. ${item.label}\n   🔗 ${item.url}\n`;
-      const prefix = currentSub === item.slug ? '✅ ' : '';
+      const prefix = currentSubs.has(item.slug) ? '✅ ' : '';
       const shortLabel = item.label.length > 26 ? `${item.label.slice(0, 24)}…` : item.label;
       return { text: `${prefix}${shortLabel}`, callback_data: `flt:disc:${idx}` };
     });
@@ -835,14 +1165,28 @@ function registerBotHandlers(botInstance, options = {}) {
       ? getMaxOfferPrice(options.maxOfferPrice)
       : userFilters.maxPrice;
     const allSent = loadSentOffers(offersPath);
-    const activeForUser = maxPrice > 0
-      ? allSent.filter((o) => {
-          const p = getOfferPrice(o);
-          return Number.isFinite(p) && p > 0 && p <= maxPrice;
-        })
-      : allSent;
 
-    if (activeForUser.length === 0) {
+    const activeMatching = allSent.filter((o) => {
+      if (o.active === false) return false;
+      if (maxPrice > 0) {
+        const p = getOfferPrice(o);
+        return Number.isFinite(p) && p > 0 && p <= maxPrice;
+      }
+      return true;
+    });
+
+    // Show each cruise variant once (lowest active price if multiple recorded)
+    const dedupedOffers = [];
+    for (const offer of activeMatching) {
+      const existingIdx = dedupedOffers.findIndex((d) => isSameCruiseVariant(d, offer));
+      if (existingIdx === -1) {
+        dedupedOffers.push(offer);
+      } else if (getOfferPrice(offer) < getOfferPrice(dedupedOffers[existingIdx])) {
+        dedupedOffers[existingIdx] = offer;
+      }
+    }
+
+    if (dedupedOffers.length === 0) {
       const limitText = maxPrice > 0
         ? `menores o iguales a $${maxPrice} USD`
         : 'registradas todavía';
@@ -858,8 +1202,8 @@ function registerBotHandlers(botInstance, options = {}) {
       : `📢 Ofertas registradas actualmente:\n\n`;
     let currentChunk = header;
 
-    for (let index = 0; index < Math.min(activeForUser.length, 15); index++) {
-      const offer = activeForUser[index];
+    for (let index = 0; index < Math.min(dedupedOffers.length, 15); index++) {
+      const offer = dedupedOffers[index];
       const priceVal = getOfferPrice(offer);
       const cur = offer.moneda || offer.precio?.moneda || 'USD';
       const port = offer.puerto || offer.puerto_salida || 'No especificado';
@@ -899,23 +1243,75 @@ function registerBotHandlers(botInstance, options = {}) {
       chatId,
       `🔎 Buscando cruceros con tus filtros...\n🎛 ${formatShortFilterCaption(filters)}`
     );
-    await runReportCycle({
+    const res = await runReportCycle({
       bot: botInstance,
       targetChatIds: [chatId],
       usersFilePath: usersPath,
       sentOffersFilePath: offersPath,
       scraperFn: options.scraperFn,
       maxOfferPrice: options.maxOfferPrice,
+      telegramRetryDelayMs: options.telegramRetryDelayMs,
       sendDocument: true,
       notifyManualSummary: true
     });
+    if (res && res.success === false && !res.skipped) {
+      await botInstance.sendMessage(
+        chatId,
+        `⚠️ No pude completar la búsqueda en MSC (${res.error}). Probá nuevamente en unos minutos.`
+      ).catch(() => {});
+    }
+  };
+
+  const backoffSchedule = Array.isArray(options.pollingBackoffMs) && options.pollingBackoffMs.length > 0
+    ? options.pollingBackoffMs
+    : DEFAULT_POLLING_BACKOFF_MS;
+  let pollingFailureStreak = 0;
+  let lastLoggedPollMsg = '';
+
+  const resetPollingBackoff = () => {
+    pollingFailureStreak = 0;
+    lastLoggedPollMsg = '';
   };
 
   botInstance.on('polling_error', (error) => {
-    console.error(`[Telegram Polling Error] Code: ${error.code || 'UNKNOWN'}, Message: ${error.message}`);
-    if (error.response && error.response.statusCode === 401 && typeof botInstance.stopPolling === 'function') {
+    const errCode = error?.code || 'UNKNOWN';
+    const errMsg = error?.message || String(error);
+    const sig = `${errCode}:${errMsg}`;
+
+    if (error?.response?.statusCode === 401 && typeof botInstance.stopPolling === 'function') {
       console.error('[Telegram Fatal] Unauthorized token. Stopping polling.');
       botInstance.stopPolling().catch(() => {});
+      return;
+    }
+
+    if (sig !== lastLoggedPollMsg) {
+      console.error(`[Telegram Polling Error] Code: ${errCode}, Message: ${errMsg}`);
+      lastLoggedPollMsg = sig;
+    }
+
+    if (
+      isTransientTelegramError(error) &&
+      typeof botInstance.stopPolling === 'function' &&
+      typeof botInstance.startPolling === 'function'
+    ) {
+      if (pollingRestartTimer) return;
+      const retryAfterMs = extractRetryAfterMs(error);
+      const stepDelay = backoffSchedule[Math.min(pollingFailureStreak, backoffSchedule.length - 1)];
+      const waitMs = Math.max(retryAfterMs, stepDelay);
+      pollingFailureStreak++;
+      console.warn(`[Telegram Polling] Reintentando conexión en ${waitMs}ms (backoff #${pollingFailureStreak})...`);
+
+      Promise.resolve(botInstance.stopPolling({ cancel: true }))
+        .catch(() => {})
+        .finally(() => {
+          pollingRestartTimer = setTimeout(() => {
+            pollingRestartTimer = null;
+            Promise.resolve(botInstance.startPolling()).catch((startErr) => {
+              console.error('[Telegram Polling] Error al reanudar polling:', startErr.message);
+            });
+          }, waitMs);
+          if (typeof pollingRestartTimer.unref === 'function') pollingRestartTimer.unref();
+        });
     }
   });
 
@@ -1018,15 +1414,22 @@ function registerBotHandlers(botInstance, options = {}) {
         return;
       }
       await botInstance.sendMessage(chatId, '🚀 Iniciando generación de reporte...');
-      await runReportCycle({
+      const res = await runReportCycle({
         bot: botInstance,
         targetChatIds: [chatId],
         usersFilePath: usersPath,
         sentOffersFilePath: offersPath,
         scraperFn: options.scraperFn,
         maxOfferPrice: options.maxOfferPrice,
+        telegramRetryDelayMs: options.telegramRetryDelayMs,
         sendDocument: true
       });
+      if (res && res.success === false && !res.skipped) {
+        await botInstance.sendMessage(
+          chatId,
+          `⚠️ No pude generar el reporte ahora (${res.error}). Probá nuevamente en unos minutos.`
+        ).catch(() => {});
+      }
     } catch (err) {
       console.error('[Command Error /report]:', err.message);
     }
@@ -1045,6 +1448,7 @@ function registerBotHandlers(botInstance, options = {}) {
   });
 
   botInstance.on('callback_query', async (query) => {
+    resetPollingBackoff();
     const chatId = query?.message?.chat?.id;
     const messageId = query?.message?.message_id;
     const data = String(query?.data || '');
@@ -1076,12 +1480,27 @@ function registerBotHandlers(botInstance, options = {}) {
         return;
       }
 
-      if (action === 'sub') {
-        const opt = FILTER_OPTIONS.subcategories.find((s) => s.code === value);
-        const subcategory = opt ? opt.value : '';
-        updateUserFilters(chatId, { subcategory }, usersPath);
-        await safeAnswerCallback(botInstance, query.id, `Subcategoría: ${opt ? opt.label : 'Global'}`);
-        await sendFilterMenu(chatId, messageId, 'main');
+      if (MULTI_FILTER_META[action]) {
+        const meta = MULTI_FILTER_META[action];
+        const opt = meta.list.find((item) => item.code === value);
+        if (!opt) {
+          await safeAnswerCallback(botInstance, query.id);
+          return;
+        }
+        const val = getOptionValue(opt);
+        const current = getUserFilters(chatId, usersPath);
+        const allowedSet = new Set(meta.list.map(getOptionValue).filter(Boolean));
+        if (val === '') {
+          updateUserFilters(chatId, { [meta.field]: '', ...meta.extraPatch }, usersPath);
+          await safeAnswerCallback(botInstance, query.id, meta.emptyToast);
+          await sendFilterMenu(chatId, messageId, 'main');
+          return;
+        }
+        const nextCsv = toggleMultiValue(current[meta.field], val, allowedSet, Boolean(meta.allowSlug));
+        const updated = updateUserFilters(chatId, { [meta.field]: nextCsv, ...meta.extraPatch }, usersPath);
+        const toast = (formatMultiFilterLabel(meta.list, updated[meta.field]) || meta.emptyToast).slice(0, 120);
+        await safeAnswerCallback(botInstance, query.id, toast);
+        await sendFilterMenu(chatId, messageId, action);
         return;
       }
 
@@ -1099,9 +1518,13 @@ function registerBotHandlers(botInstance, options = {}) {
           await handleDiscoverPromos(chatId);
           return;
         }
-        updateUserFilters(chatId, { subcategory: item.slug }, usersPath);
-        await safeAnswerCallback(botInstance, query.id, `Seleccionado: ${item.label}`);
-        await sendFilterMenu(chatId, null, 'main', `✅ Subcategoría seleccionada: ${item.label}\n🔗 ${item.url}`);
+        const current = getUserFilters(chatId, usersPath);
+        const validSubs = new Set(FILTER_OPTIONS.subcategories.map(getOptionValue).filter(Boolean));
+        const nextCsv = toggleMultiValue(current.subcategory, item.slug, validSubs, true);
+        updateUserFilters(chatId, { subcategory: nextCsv }, usersPath);
+        const added = parseMultiValues(nextCsv, validSubs, true).includes(item.slug);
+        await safeAnswerCallback(botInstance, query.id, `${added ? 'Activado' : 'Quitado'}: ${item.label}`);
+        await sendFilterMenu(chatId, null, 'main', `${added ? '✅' : '☑️'} Subcategorías activas: ${nextCsv || 'Buscador global'}\n🔗 ${item.url}`);
         return;
       }
 
@@ -1110,24 +1533,6 @@ function registerBotHandlers(botInstance, options = {}) {
         const tripType = opt ? opt.value : '';
         updateUserFilters(chatId, { tripType }, usersPath);
         await safeAnswerCallback(botInstance, query.id, `Tipo: ${opt ? opt.label : 'Todos'}`);
-        await sendFilterMenu(chatId, messageId, 'main');
-        return;
-      }
-
-      if (action === 'area') {
-        const opt = FILTER_OPTIONS.areas.find((a) => a.code === value);
-        const area = opt ? (opt.value !== undefined ? opt.value : opt.code) : 'SOA';
-        updateUserFilters(chatId, { area, subcategory: '' }, usersPath);
-        await safeAnswerCallback(botInstance, query.id, `Destino: ${opt ? opt.label : area}`);
-        await sendFilterMenu(chatId, messageId, 'main');
-        return;
-      }
-
-      if (action === 'port') {
-        const opt = FILTER_OPTIONS.ports.find((p) => p.code === value);
-        const embkPort = opt ? opt.value : 'BUE,MVD';
-        updateUserFilters(chatId, { embkPort, subcategory: '' }, usersPath);
-        await safeAnswerCallback(botInstance, query.id, `Salida: ${opt ? opt.label : embkPort}`);
         await sendFilterMenu(chatId, messageId, 'main');
         return;
       }
@@ -1145,24 +1550,6 @@ function registerBotHandlers(botInstance, options = {}) {
         }
         updateUserFilters(chatId, { datePreset: value, dateFrom: '', dateTo: '' }, usersPath);
         await safeAnswerCallback(botInstance, query.id, 'Fechas actualizadas');
-        await sendFilterMenu(chatId, messageId, 'main');
-        return;
-      }
-
-      if (action === 'cab') {
-        const opt = FILTER_OPTIONS.cabins.find((c) => c.code === value);
-        const cabin = opt ? opt.value : '';
-        updateUserFilters(chatId, { cabin }, usersPath);
-        await safeAnswerCallback(botInstance, query.id, `Camarote: ${cabin || 'Todas'}`);
-        await sendFilterMenu(chatId, messageId, 'main');
-        return;
-      }
-
-      if (action === 'dur') {
-        const opt = FILTER_OPTIONS.nights.find((n) => n.code === value);
-        const nights = opt ? opt.value : '';
-        updateUserFilters(chatId, { nights }, usersPath);
-        await safeAnswerCallback(botInstance, query.id, `Noches: ${nights || 'Todas'}`);
         await sendFilterMenu(chatId, messageId, 'main');
         return;
       }
@@ -1210,6 +1597,7 @@ function registerBotHandlers(botInstance, options = {}) {
   });
 
   botInstance.on('message', async (msg) => {
+    resetPollingBackoff();
     const chatId = msg?.chat?.id;
     const text = msg?.text;
     if (chatId === undefined || chatId === null || typeof text !== 'string') return;
@@ -1262,7 +1650,7 @@ function initBot(token = (process.env.TOKEN || process.env.TELEGRAM_BOT_TOKEN ||
     throw new Error('[Config Error] Telegram bot token is missing.');
   }
 
-  bot = new TelegramBot(token, { polling: options.polling !== undefined ? options.polling : true });
+  bot = new TelegramBot(token, buildBotOptions(options));
   if (typeof bot.setMyCommands === 'function') {
     bot.setMyCommands([
       { command: 'filtros', description: 'Configurar destino, salida, fechas, camarote y precio' },
@@ -1280,13 +1668,25 @@ async function gracefulShutdown(signal = 'SIGINT') {
   console.log(`[Shutdown] Received ${signal}. Starting graceful shutdown...`);
   stopScheduler();
 
+  if (pollingRestartTimer) {
+    clearTimeout(pollingRestartTimer);
+    pollingRestartTimer = null;
+  }
+
   if (bot && typeof bot.isPolling === 'function' && bot.isPolling()) {
     try {
-      await bot.stopPolling();
+      await Promise.race([
+        bot.stopPolling({ cancel: true }),
+        new Promise((r) => setTimeout(r, 2000))
+      ]);
       console.log('[Shutdown] Telegram bot polling stopped.');
     } catch (err) {
       console.error('[Shutdown] Error stopping polling:', err.message);
     }
+  }
+
+  if (activeLockPath) {
+    releaseInstanceLock(activeLockPath);
   }
 
   if (process.env.NODE_ENV !== 'test') {
@@ -1295,6 +1695,16 @@ async function gracefulShutdown(signal = 'SIGINT') {
 }
 
 if (require.main === module) {
+  const lock = acquireInstanceLock();
+  if (!lock.acquired) {
+    console.error(`❌ Ya hay otra instancia de DrinkTheStick ejecutándose (PID ${lock.existingPid}). Detenela antes de iniciar otra.`);
+    process.exit(1);
+  }
+  activeLockPath = lock.lockPath;
+
+  process.on('exit', () => {
+    if (activeLockPath) releaseInstanceLock(activeLockPath);
+  });
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
@@ -1321,12 +1731,19 @@ module.exports = {
   FILTER_OPTIONS,
   getDefaultFilters,
   normalizeFilters,
+  parseMultiValues,
+  toggleMultiValue,
+  formatMultiFilterLabel,
   getSearchFilterKey,
   formatFilterSummary,
   buildFilterKeyboard,
   parseManualDateRange,
   parseManualPrice,
   normalizeItineraryUrl,
+  isSameOffer,
+  buildBotOptions,
+  isTransientTelegramError,
+  callTelegramWithRetry,
   initBot,
   registerBotHandlers,
   runReportCycle,
@@ -1342,6 +1759,8 @@ module.exports = {
   resetUserFilters,
   loadSentOffers,
   saveSentOffers,
+  acquireInstanceLock,
+  releaseInstanceLock,
   isJobRunning: () => isJobRunning,
   getScheduledJob: () => scheduledJob,
   getBot: () => bot

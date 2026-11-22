@@ -225,6 +225,148 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
     assert.strictEqual(onDemand.success, true);
     assert.strictEqual(onDemand.documentsSent, 2);
     assert.strictEqual(onDemand.offersSent, 0);
+
+    // Partial/changed broadcast run where $750 disappears temporarily must NOT wipe persisted history
+    const partialRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      scraperFn: async () => ({
+        success: true,
+        totalCruceros: 1,
+        xlsxPath: xlsxFile,
+        cruceros: [
+          {
+            destino: 'Caribe',
+            duracion: '10 Noches',
+            barco: 'MSC Seascape',
+            puerto_salida: 'Miami',
+            precio: { moneda: 'USD', valor: 1200 },
+            fechas_disponibles: ['15 Ene 2027'],
+            url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=CAR99&adults=2&children=0&infants=0&juniors=0',
+            pagina: 1
+          }
+        ]
+      }),
+      maxOfferPrice: 800
+    });
+    assert.strictEqual(partialRes.success, true);
+    const persistedInactive = app.loadSentOffers(offersFile);
+    assert.strictEqual(persistedInactive.length, 1);
+    assert.strictEqual(persistedInactive[0].active, false);
+    assert.deepStrictEqual(persistedInactive[0].chatIds, [10001, 20002]);
+
+    // When $750 returns on a later cycle (even inside a duplicate array), it MUST NOT re-send
+    const returnedRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      scraperFn: mockScraper,
+      maxOfferPrice: 800
+    });
+    assert.strictEqual(returnedRes.offersSent, 0);
+    assert.strictEqual(app.loadSentOffers(offersFile)[0].active, true);
+  });
+
+  it('deduplicates by cruiseId across price increases and persists group 1 before group 2 error', async () => {
+    const mockBot = createMockBot();
+    app.saveUserRecords([
+      { chatId: '10001', filters: { area: 'SOA', maxPrice: 900 } },
+      { chatId: '20002', filters: { area: 'CAR', maxPrice: 900 } }
+    ], usersFile);
+
+    let callNum = 0;
+    const partialCrashRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      scraperFn: async () => {
+        callNum++;
+        if (callNum === 2) throw new Error('Group 2 failed');
+        return {
+          success: true,
+          totalCruceros: 2,
+          xlsxPath: xlsxFile,
+          cruceros: [
+            {
+              destino: 'Sudamérica',
+              duracion: '8 Noches',
+              barco: 'MSC Splendida',
+              puerto_salida: 'Buenos Aires',
+              precio: { moneda: 'USD', valor: 771 },
+              fechas_disponibles: ['3 Dic 2026'],
+              url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=SP01&adults=2&children=0&infants=0&juniors=0',
+              pagina: 1
+            },
+            {
+              // Duplicate in same scrape result
+              destino: 'Brasil',
+              duracion: '8 Noches',
+              barco: 'MSC Splendida',
+              puerto_salida: 'Buenos Aires',
+              precio: { moneda: 'USD', valor: 771 },
+              fechas_disponibles: ['03/12/2026'],
+              url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=SP01&adults=2&children=0&infants=0&juniors=0',
+              pagina: 1
+            }
+          ]
+        };
+      }
+    });
+
+    assert.strictEqual(partialCrashRes.success, false);
+    assert.strictEqual(mockBot.sentMessages.length, 1); // Group 1 deduplicated intra-cycle
+    assert.strictEqual(app.loadSentOffers(offersFile).length, 1); // Group 1 saved immediately before Group 2 crashed
+
+    // Remove user 20002; test same cruiseId at slightly higher price ($811 <= $900) does NOT spam, while strict drop ($690) notifies
+    app.saveUserRecords([{ chatId: 10001, filters: { area: 'SOA', maxPrice: 900 } }], usersFile);
+    const bumpRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      scraperFn: async () => ({
+        success: true,
+        totalCruceros: 1,
+        xlsxPath: xlsxFile,
+        cruceros: [
+          {
+            destino: 'Brasil',
+            duracion: '8 Noches',
+            barco: 'MSC Splendida',
+            puerto_salida: 'Buenos Aires',
+            precio: { moneda: 'USD', valor: 811 },
+            fechas_disponibles: ['03 Dic 2026'],
+            url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=SP01&adults=2&children=0&infants=0&juniors=0',
+            pagina: 1
+          }
+        ]
+      })
+    });
+    assert.strictEqual(bumpRes.offersSent, 0);
+
+    const dropRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      scraperFn: async () => ({
+        success: true,
+        totalCruceros: 1,
+        xlsxPath: xlsxFile,
+        cruceros: [
+          {
+            destino: 'Sudamérica',
+            duracion: '8 Noches',
+            barco: 'MSC Splendida',
+            puerto_salida: 'Buenos Aires',
+            precio: { moneda: 'USD', valor: 690 },
+            fechas_disponibles: ['03 Dic 2026'],
+            url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=SP01&adults=2&children=0&infants=0&juniors=0',
+            pagina: 1
+          }
+        ]
+      })
+    });
+    assert.strictEqual(dropRes.offersSent, 1);
   });
 
   it('handles /offers and /report commands cleanly', async () => {
@@ -298,6 +440,26 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
     assert.strictEqual(updated.subcategory, 'cyber-week');
   });
 
+  it('recovers from stale instance lockfiles and blocks active duplicate PIDs cleanly', () => {
+    const lockFile = path.join(tmpDir, 'test.pid');
+    // Dead PID (unlikely to exist) should be overtaken cleanly
+    fs.writeFileSync(lockFile, '999999', 'utf8');
+    const rec = app.acquireInstanceLock(lockFile);
+    assert.strictEqual(rec.acquired, true);
+    assert.strictEqual(Number(fs.readFileSync(lockFile, 'utf8')), process.pid);
+
+    // Simulate another live PID owning the lock using PPID (always alive)
+    fs.writeFileSync(lockFile, String(process.ppid), 'utf8');
+    const blocked = app.acquireInstanceLock(lockFile);
+    assert.strictEqual(blocked.acquired, false);
+    assert.strictEqual(blocked.existingPid, process.ppid);
+
+    // Restore own PID and verify release cleans up file
+    fs.writeFileSync(lockFile, String(process.pid), 'utf8');
+    app.releaseInstanceLock(lockFile);
+    assert.strictEqual(fs.existsSync(lockFile), false);
+  });
+
   it('prevents overlapping runs with mutex and resets lock on scraper failure', async () => {
     let releaseScraper;
     const slowScraper = () => new Promise((resolve) => {
@@ -363,7 +525,7 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
               barco: 'MSC Seascape',
               puerto_salida: 'Buenos Aires',
               precio: { moneda: 'USD', valor: 1150 },
-              camarote: 'Vista al mar',
+              camarote: opts?.filters?.cabin || 'Vista al mar',
               fechas_disponibles: ['15 Ene 2027'],
               url_itinerario: 'https://www.msccruceros.com.ar',
               pagina: 1
@@ -384,26 +546,39 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
     assert.ok(allCallbacks.includes('flt:open:cab'));
     assert.ok(allCallbacks.every((cb) => Buffer.byteLength(cb, 'utf8') <= 64));
 
-    // 2. Navigate submenus via inline buttons (including subcategory & tripType)
+    // 2. Navigate submenus via inline buttons (multi-select toggles stay open in submenu)
     await mockBot.simulateCallback(999888440, 'flt:open:sub', menuMsg.message_id);
     await mockBot.simulateCallback(999888440, 'flt:sub:BF', menuMsg.message_id);
-    assert.strictEqual(app.getUserFilters(999888440, usersFile).subcategory, 'black-friday');
+    await mockBot.simulateCallback(999888440, 'flt:sub:BR', menuMsg.message_id);
+    assert.strictEqual(app.getUserFilters(999888440, usersFile).subcategory, 'black-friday,brasil');
 
-    // Selecting area clears subcategory back to global search
+    // Selecting area clears subcategory back to global search and toggles multiple destinations
     await mockBot.simulateCallback(999888440, 'flt:open:area', menuMsg.message_id);
     await mockBot.simulateCallback(999888440, 'flt:area:CAR', menuMsg.message_id);
     assert.strictEqual(app.getUserFilters(999888440, usersFile).subcategory, '');
+    assert.strictEqual(app.getUserFilters(999888440, usersFile).area, 'SOA,CAR');
+    await mockBot.simulateCallback(999888440, 'flt:area:SOA', menuMsg.message_id);
+    assert.strictEqual(app.getUserFilters(999888440, usersFile).area, 'CAR');
 
     await mockBot.simulateCallback(999888440, 'flt:open:trip', menuMsg.message_id);
     await mockBot.simulateCallback(999888440, 'flt:trip:RT', menuMsg.message_id);
 
+    // Ports start as BUE,MVD -> toggling MVD off leaves BUE
     await mockBot.simulateCallback(999888440, 'flt:open:port', menuMsg.message_id);
-    await mockBot.simulateCallback(999888440, 'flt:port:BUE', menuMsg.message_id);
+    await mockBot.simulateCallback(999888440, 'flt:port:MVD', menuMsg.message_id);
+    assert.strictEqual(app.getUserFilters(999888440, usersFile).embkPort, 'BUE');
 
+    // Select TWO cabin categories (Vista al mar + Camarote con balcón) without losing the first
     await mockBot.simulateCallback(999888440, 'flt:open:cab', menuMsg.message_id);
     await mockBot.simulateCallback(999888440, 'flt:cab:SEA', menuMsg.message_id);
+    await mockBot.simulateCallback(999888440, 'flt:cab:BAL', menuMsg.message_id);
+    const cabKeyboard = mockBot.editedMessages.at(-1).options.reply_markup.inline_keyboard.flat();
+    assert.ok(cabKeyboard.some((b) => b.callback_data === 'flt:cab:SEA' && b.text.startsWith('✅ ')));
+    assert.ok(cabKeyboard.some((b) => b.callback_data === 'flt:cab:BAL' && b.text.startsWith('✅ ')));
 
+    // Select TWO duration buckets (6-7 and 8+)
     await mockBot.simulateCallback(999888440, 'flt:open:dur', menuMsg.message_id);
+    await mockBot.simulateCallback(999888440, 'flt:dur:6-7', menuMsg.message_id);
     await mockBot.simulateCallback(999888440, 'flt:dur:8+', menuMsg.message_id);
 
     // 3. Manual price input with validation + success
@@ -429,17 +604,17 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
       datePreset: 'custom',
       dateFrom: '01/12/2026',
       dateTo: '31/03/2027',
-      cabin: 'Vista al mar',
-      nights: '8+',
+      cabin: 'Vista al mar,Camarote con balcón',
+      nights: '6-7,8+',
       maxPrice: 1250
     });
 
-    // 5. Execute on-demand search from inline button using saved filters
+    // 5. Execute on-demand search from inline button using saved filters (2 cabins x 2 nights = 4 scrapes, 1 merged Excel)
     await mockBot.simulateCallback(999888440, 'flt:run', menuMsg.message_id);
-    assert.strictEqual(capturedScraperOpts.length, 1);
-    assert.deepStrictEqual(capturedScraperOpts[0].filters, saved);
+    assert.strictEqual(capturedScraperOpts.length, 4);
     assert.strictEqual(mockBot.sentDocuments.length, 1);
     assert.ok(mockBot.sentMessages.some((m) => m.text.includes('Vista al mar') && m.text.includes('1150 USD')));
+    assert.ok(mockBot.sentMessages.some((m) => m.text.includes('Camarote con balcón') && m.text.includes('1150 USD')));
 
     // 6. Reset filters button restores defaults
     await mockBot.simulateCallback(999888440, 'flt:reset', menuMsg.message_id);
@@ -447,6 +622,47 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
     assert.strictEqual(reset.area, 'SOA');
     assert.strictEqual(reset.cabin, '');
     assert.strictEqual(reset.nights, '');
+  });
+
+  it('shares overlapping multi-cabin atomic scrapes across users in broadcast mode', async () => {
+    const mockBot = createMockBot();
+    app.saveUserRecords([
+      { chatId: 111, filters: { area: 'SOA', cabin: 'Interior,Vista al mar', maxPrice: 950 } },
+      { chatId: 222, filters: { area: 'SOA', cabin: 'Vista al mar', maxPrice: 950 } }
+    ], usersFile);
+
+    const seenCabins = [];
+    const res = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      scraperFn: async (opts) => {
+        seenCabins.push(opts.filters.cabin);
+        return {
+          success: true,
+          totalCruceros: 1,
+          xlsxPath: xlsxFile,
+          cruceros: [
+            {
+              destino: 'Sudamérica',
+              duracion: '8 Noches',
+              barco: 'MSC Splendida',
+              puerto_salida: 'Buenos Aires',
+              precio: { moneda: 'USD', valor: opts.filters.cabin === 'Interior' ? 750 : 890 },
+              camarote: opts.filters.cabin,
+              fechas_disponibles: ['03 Dic 2026'],
+              url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=SP01&adults=2&children=0&infants=0&juniors=0',
+              pagina: 1
+            }
+          ]
+        };
+      }
+    });
+
+    assert.strictEqual(res.success, true);
+    assert.deepStrictEqual(seenCabins, ['Interior', 'Vista al mar']); // Vista al mar scraped ONCE and shared
+    // 111 receives both Interior ($750) and Vista al mar ($890); 222 receives Vista al mar ($890)
+    assert.strictEqual(res.offersSent, 3);
   });
 
   it('groups broadcast scrapes by unique search filters and enforces per-user maxPrice alerts', async () => {
@@ -513,5 +729,105 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
     // 111 receives $941 (<=950), 222 skips $941 (>900), 333 receives $1200 (<=1300)
     assert.strictEqual(res.offersSent, 2);
     assert.deepStrictEqual(mockBot.sentMessages.map((m) => m.chatId), [111, 333]);
+  });
+
+  it('handles ECONNREFUSED in Telegram polling backoff, send retries, IPv4 config, and manual error notice', async () => {
+    const botOpts = app.buildBotOptions({ polling: true });
+    assert.strictEqual(botOpts.request.family, 4);
+
+    // 1. Retries transient ECONNREFUSED on sendMessage and notifies cleanly on manual MSC ECONNREFUSED
+    const mockBot = createMockBot();
+    let msgFailures = 0;
+    const baseSend = mockBot.sendMessage.bind(mockBot);
+    mockBot.sendMessage = async (chatId, text, options = {}) => {
+      if (text.includes('¡Nueva oferta encontrada!') && msgFailures === 0) {
+        msgFailures++;
+        const err = new Error('connect ECONNREFUSED 149.154.167.220:443');
+        err.code = 'EFATAL';
+        throw err;
+      }
+      return baseSend(chatId, text, options);
+    };
+
+    let pollStops = 0;
+    let pollStarts = 0;
+    mockBot.stopPolling = async () => { pollStops++; };
+    mockBot.startPolling = async () => { pollStarts++; };
+
+    app.saveUserRecords([{ chatId: 444555, filters: { area: 'SOA', maxPrice: 900 } }], usersFile);
+
+    let failScrape = false;
+    app.registerBotHandlers(mockBot, {
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      pollingBackoffMs: [20, 40],
+      telegramRetryDelayMs: 5,
+      scraperFn: async () => {
+        if (failScrape) {
+          return {
+            success: false,
+            errorCode: 'ECONNREFUSED',
+            error: 'Conexión rechazada (ECONNREFUSED) al conectar con https://www.msccruceros.com.ar'
+          };
+        }
+        return {
+          success: true,
+          totalCruceros: 1,
+          xlsxPath: xlsxFile,
+          cruceros: [
+            {
+              destino: 'Sudamérica',
+              duracion: '8 Noches',
+              barco: 'MSC Splendida',
+              puerto_salida: 'Buenos Aires',
+              precio: { moneda: 'USD', valor: 750 },
+              fechas_disponibles: ['03 Dic 2026'],
+              url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=SP99&adults=2&children=0&infants=0&juniors=0',
+              pagina: 1
+            }
+          ]
+        };
+      }
+    });
+
+    // Offer alert succeeds on retry 2 after transient EFATAL/ECONNREFUSED
+    const cycleRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      telegramRetryDelayMs: 5,
+      scraperFn: async () => ({
+        success: true,
+        totalCruceros: 1,
+        xlsxPath: xlsxFile,
+        cruceros: [
+          {
+            destino: 'Sudamérica',
+            duracion: '8 Noches',
+            barco: 'MSC Splendida',
+            puerto_salida: 'Buenos Aires',
+            precio: { moneda: 'USD', valor: 750 },
+            fechas_disponibles: ['03 Dic 2026'],
+            url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=SP99&adults=2&children=0&infants=0&juniors=0',
+            pagina: 1
+          }
+        ]
+      })
+    });
+    assert.strictEqual(cycleRes.offersSent, 1);
+    assert.strictEqual(msgFailures, 1);
+
+    // 2. Manual /report informs the user cleanly when MSC fails with ECONNREFUSED
+    failScrape = true;
+    await mockBot.simulateText(444555, '/report');
+    assert.ok(mockBot.sentMessages.some((m) => m.chatId === 444555 && m.text.includes('ECONNREFUSED')));
+
+    // 3. polling_error backs off via stopPolling -> startPolling cleanly
+    const pollErr = new Error('connect ECONNREFUSED 149.154.167.220:443');
+    pollErr.code = 'EFATAL';
+    mockBot.emit('polling_error', pollErr);
+    await new Promise((r) => setTimeout(r, 60));
+    assert.strictEqual(pollStops, 1);
+    assert.strictEqual(pollStarts, 1);
   });
 });

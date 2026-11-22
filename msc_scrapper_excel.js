@@ -109,6 +109,50 @@ const EXCLUDED_PROMO_SLUGS = new Set([
   "2028-cruises"
 ]);
 
+function parseFilterCsv(raw) {
+  const arr = Array.isArray(raw)
+    ? raw.map((x) => String(x || "").trim())
+    : String(raw || "").split(",").map((x) => x.trim());
+  return [...new Set(arr.filter(Boolean))];
+}
+
+/**
+ * Expands multi-value filter fields (`subcategory`, `cabin`, `nights`) into atomic
+ * scrape specs while keeping comma-joined `area` and `embkPort` in a single URL.
+ *
+ * @param {Object|null} [filters=null]
+ * @returns {Array<Object|null>}
+ */
+function expandFilterCombos(filters = null) {
+  if (!filters || typeof filters !== "object") return [null];
+  const normalizedArea = filters.area !== undefined ? parseFilterCsv(filters.area).join(",") : "SOA";
+  const normalizedPort = filters.embkPort !== undefined ? parseFilterCsv(filters.embkPort).join(",") : "BUE,MVD";
+  const subs = parseFilterCsv(filters.subcategory);
+  const cabins = parseFilterCsv(filters.cabin);
+  const nightsList = parseFilterCsv(filters.nights);
+
+  const subTargets = subs.length > 0 ? subs : [""];
+  const cabinTargets = cabins.length > 0 ? cabins : [""];
+  const nightsTargets = nightsList.length > 0 ? nightsList : [""];
+
+  const combos = [];
+  for (const subcategory of subTargets) {
+    for (const cabin of cabinTargets) {
+      for (const nights of nightsTargets) {
+        combos.push({
+          ...filters,
+          area: normalizedArea,
+          embkPort: normalizedPort,
+          subcategory,
+          cabin,
+          nights
+        });
+      }
+    }
+  }
+  return combos;
+}
+
 /**
  * Builds the MSC search URL with encoded departure dates and search parameters.
  * Uses curated promo URL when `filters.subcategory` is selected (known alias or discovered slug);
@@ -127,7 +171,7 @@ function buildSearchUrl(dates, page = 1, filters = null) {
     return `${baseUrl}?departureDateFrom=${fromEnc}&departureDateTo=${toEnc}&passengers=2%7C0%7C0%7C0&area=SOA&embkPort=BUE%2CMVD&page=${page}`;
   }
 
-  const subKey = filters.subcategory ? String(filters.subcategory).trim() : "";
+  const subKey = parseFilterCsv(filters.subcategory)[0] || "";
   if (subKey) {
     let subUrl = SUBCATEGORY_URLS[subKey] || "";
     if (!subUrl && /^[a-z0-9-]+$/i.test(subKey)) {
@@ -144,11 +188,14 @@ function buildSearchUrl(dates, page = 1, filters = null) {
   params.set("departureDateTo", dates.departureDateTo);
   params.set("passengers", "2|0|0|0");
 
-  const area = filters.area !== undefined ? String(filters.area).trim() : "SOA";
+  const area = filters.area !== undefined ? parseFilterCsv(filters.area).join(",") : "SOA";
   if (area) params.set("area", area);
 
-  const embkPort = filters.embkPort !== undefined ? String(filters.embkPort).trim() : "BUE,MVD";
+  const embkPort = filters.embkPort !== undefined ? parseFilterCsv(filters.embkPort).join(",") : "BUE,MVD";
   if (embkPort) params.set("embkPort", embkPort);
+
+  const cabin = parseFilterCsv(filters.cabin)[0] || "";
+  if (cabin) params.set("cabins", cabin);
 
   params.set("page", String(page));
   return `${baseUrl}?${params.toString()}`;
@@ -265,42 +312,91 @@ async function launchBrowser(userOptions = {}) {
   const defaultViewport = { width: 1440, height: 900 };
   const macHostChrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
-  // Strategy 1: Operator / CI override via PUPPETEER_EXECUTABLE_PATH
+  const strategies = [];
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-    return await puppeteer.launch({
-      headless: isHeadless,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
-      defaultViewport,
-      args: baseArgs
-    });
+    strategies.push({ executablePath: process.env.PUPPETEER_EXECUTABLE_PATH });
   }
+  strategies.push({ channel: "chrome" });
+  if (process.platform === "darwin" && fs.existsSync(macHostChrome)) {
+    strategies.push({ executablePath: macHostChrome });
+  }
+  strategies.push({});
 
-  // Strategy 2: Puppeteer channel: 'chrome' (uses system Google Chrome)
-  try {
-    return await puppeteer.launch({
-      headless: isHeadless,
-      channel: "chrome",
-      defaultViewport,
-      args: baseArgs
-    });
-  } catch (channelErr) {
-    // Strategy 3: Explicit macOS host Chrome fallback
-    if (process.platform === "darwin" && fs.existsSync(macHostChrome)) {
+  let lastErr = null;
+  for (const extra of strategies) {
+    try {
       return await puppeteer.launch({
         headless: isHeadless,
-        executablePath: macHostChrome,
         defaultViewport,
-        args: baseArgs
+        args: baseArgs,
+        ...extra
       });
+    } catch (err) {
+      lastErr = err;
     }
-
-    // Strategy 4: Default Puppeteer launch fallback
-    return await puppeteer.launch({
-      headless: isHeadless,
-      defaultViewport,
-      args: baseArgs
-    });
   }
+  throw lastErr;
+}
+
+function isConnectionRefusedError(err) {
+  const msg = String(err?.message || err || "");
+  return err?.code === "ECONNREFUSED" || /ECONNREFUSED|ERR_CONNECTION_REFUSED/i.test(msg);
+}
+
+function isTransientNetworkError(err) {
+  const msg = String(err?.message || err || "");
+  const code = String(err?.code || "");
+  if (isConnectionRefusedError(err)) return true;
+  if (["ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE"].includes(code)) return true;
+  return /ERR_CONNECTION_RESET|ERR_TIMED_OUT|ERR_NETWORK_CHANGED|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_CLOSED|ERR_CONNECTION_FAILED|Navigation timeout|Timed out|ETIMEDOUT|ECONNRESET/i.test(msg);
+}
+
+function formatNetworkError(err, url = "") {
+  const raw = String(err?.message || err || "Error desconocido de red");
+  if (isConnectionRefusedError(err)) {
+    return url
+      ? `Conexión rechazada (ECONNREFUSED) al conectar con ${url}: ${raw}`
+      : `Conexión rechazada (ECONNREFUSED): ${raw}`;
+  }
+  return raw;
+}
+
+/**
+ * Navigates to a URL with exponential backoff retries on transient connection errors
+ * such as net::ERR_CONNECTION_REFUSED / ECONNRESET / timeouts.
+ *
+ * @param {Object} page
+ * @param {string} url
+ * @param {Object} [options={}]
+ * @returns {Promise<*>}
+ */
+async function navigateWithRetry(page, url, options = {}) {
+  const maxRetries = Number.isInteger(options.navigationRetries) && options.navigationRetries >= 0
+    ? options.navigationRetries
+    : 2;
+  const baseDelayMs = Number(options.retryDelayMs) >= 0 ? Number(options.retryDelayMs) : 1200;
+  const timeout = Number(options.timeout) > 0 ? Number(options.timeout) : 45000;
+  const waitUntil = options.waitUntil || "domcontentloaded";
+
+  let lastErr;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await page.goto(url, { waitUntil, timeout });
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientNetworkError(err) || attempt >= maxRetries) {
+        throw err;
+      }
+      const delayMs = baseDelayMs * Math.pow(2, attempt);
+      console.warn(
+        `[Scraper Retry] Intento ${attempt + 1}/${maxRetries + 1} falló para ${url} (${err.message}). Reintentando en ${delayMs}ms...`
+      );
+      if (delayMs > 0) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -613,7 +709,9 @@ async function applySearchFiltersOnPage(page, filters = {}) {
   }
 
   await page.click(filterBtnSelector);
-  await page.waitForSelector(".filters-dropdown", { timeout: 5000 }).catch(() => {});
+  await page.waitForSelector(".filters-dropdown .checkbox-label", { timeout: 4000 }).catch(() =>
+    page.waitForSelector(".filters-dropdown", { timeout: 2000 }).catch(() => {})
+  );
   await new Promise((r) => setTimeout(r, 300));
 
   const selectionResult = await page.evaluate((cabin, nights) => {
@@ -693,7 +791,12 @@ async function discoverPromoLinks(options = {}) {
   try {
     browser = await launchBrowser({ headless });
     const page = await setupPage(browser);
-    await page.goto(sourceUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await navigateWithRetry(page, sourceUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 45000,
+      navigationRetries: options.navigationRetries,
+      retryDelayMs: options.retryDelayMs
+    });
     await dismissCookieBanner(page);
     await new Promise((r) => setTimeout(r, 1200));
 
@@ -742,6 +845,146 @@ async function discoverPromoLinks(options = {}) {
   }
 }
 
+async function scrapeSearchPass(page, targetUrl, filters, maxPages, navOptions = {}) {
+  console.log(`[Scraper] Navegando a: ${targetUrl}`);
+
+  await navigateWithRetry(page, targetUrl, {
+    waitUntil: "domcontentloaded",
+    timeout: 45000,
+    navigationRetries: navOptions.navigationRetries,
+    retryDelayMs: navOptions.retryDelayMs
+  });
+
+  // Dismiss Didomi Cookie Banner if present
+  await dismissCookieBanner(page);
+
+  if (filters) {
+    const uiFilters = {
+      ...filters,
+      cabin: /[?&]cabins=/i.test(targetUrl) ? "" : filters.cabin
+    };
+    if (uiFilters.cabin || uiFilters.nights) {
+      await applySearchFiltersOnPage(page, uiFilters);
+    }
+  }
+
+  const passCruceros = [];
+  let currentPage = 1;
+  let hasNextPage = true;
+
+  while (hasNextPage && currentPage <= maxPages) {
+    console.log(`[Scraper] Procesando página ${currentPage}...`);
+
+    // Wait for hydrated cruise cards (ignoring skeleton placeholders) or no-results banner
+    try {
+      await page.waitForSelector(".cruise-card:not(.tw-animate-pulse), .no-results-banner", {
+        timeout: 15000
+      });
+    } catch (_) {}
+
+    // Extract raw cruise data from DOM
+    const pageCruises = await page.evaluate(extractCruisesFromDOM, currentPage);
+
+    // Normalize prices and apply tripType filter
+    const activeCabinLabel = filters && filters.cabin ? String(filters.cabin).trim() : "Todas";
+    const tripTypeFilter = filters && filters.tripType ? String(filters.tripType).trim() : "";
+    for (const item of pageCruises) {
+      if (tripTypeFilter === "roundtrip" && item.solo_ida) continue;
+      if (tripTypeFilter === "oneway" && !item.solo_ida) continue;
+      const parsedPrice = parsePrice(item.rawPrice);
+      delete item.rawPrice;
+      item.precio = parsedPrice;
+      item.camarote = activeCabinLabel;
+      item.tipo_viaje = item.solo_ida ? "Solo ida" : "Ida y vuelta";
+      passCruceros.push(item);
+    }
+
+    console.log(`[Scraper] ${pageCruises.length} cruceros encontrados en página ${currentPage} (Total pase: ${passCruceros.length})`);
+
+    // Check pagination boundary
+    if (currentPage >= maxPages) {
+      hasNextPage = false;
+      break;
+    }
+
+    // Check if next page exists and is enabled
+    const canPaginate = await page.evaluate(() => {
+      const nextItem = document.querySelector("li.right-arrow");
+      if (!nextItem) return false;
+
+      if (nextItem.classList.contains("disabled") ||
+          nextItem.classList.contains("disabled-dots") ||
+          nextItem.getAttribute("aria-disabled") === "true") {
+        return false;
+      }
+
+      const style = window.getComputedStyle(nextItem);
+      if (style.display === "none" || style.visibility === "hidden") {
+        return false;
+      }
+
+      const pageNumbers = Array.from(document.querySelectorAll("li.number"));
+      if (pageNumbers.length > 0) {
+        const lastNumber = pageNumbers[pageNumbers.length - 1];
+        if (lastNumber && lastNumber.classList.contains("active")) {
+          return false;
+        }
+      }
+
+      return !!nextItem.querySelector("a");
+    });
+
+    if (!canPaginate) {
+      hasNextPage = false;
+      break;
+    }
+
+    // Capture state before click for reactive transition synchronization
+    const previousState = await page.evaluate(() => {
+      const activeEl = document.querySelector("li.number.active");
+      const activePage = activeEl ? activeEl.textContent.trim() : "";
+      const counterEl = document.querySelector(".pagination-wrp__counter");
+      const counterText = counterEl ? counterEl.textContent.trim() : "";
+      return { activePage, counterText };
+    });
+
+    try {
+      await page.evaluate(() => {
+        const link = document.querySelector("li.right-arrow a");
+        if (link) link.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+      await new Promise(r => setTimeout(r, 200));
+      await page.click("li.right-arrow a");
+
+      // Await reactive Vue DOM change
+      await page.waitForFunction(
+        (prev) => {
+          const currActiveEl = document.querySelector("li.number.active");
+          const currActive = currActiveEl ? currActiveEl.textContent.trim() : "";
+          if (currActive && currActive !== prev.activePage) return true;
+
+          const currCounterEl = document.querySelector(".pagination-wrp__counter");
+          const currCounter = currCounterEl ? currCounterEl.textContent.trim() : "";
+          if (currCounter && currCounter !== prev.counterText) return true;
+
+          return false;
+        },
+        { timeout: 15000 },
+        previousState
+      );
+
+      await new Promise(r => setTimeout(r, 1000));
+      currentPage++;
+    } catch (paginationError) {
+      console.warn(`[Scraper] Transición de paginación falló o finalizó en página ${currentPage}: ${paginationError.message}`);
+      hasNextPage = false;
+      break;
+    }
+  }
+
+  return { cruceros: passCruceros, pagesProcessed: currentPage };
+}
+
 /**
  * Standardized scraper entry point conforming to PROJECT.md interface contract.
  *
@@ -777,139 +1020,53 @@ async function createFile(options = {}) {
     browser = await launchBrowser({ headless });
     page = await setupPage(browser);
 
-    const searchDates = filters ? resolveSearchDates(filters) : calculateDepartureDates();
-    const targetUrl = options.customUrl || buildSearchUrl(searchDates, 1, filters);
-    console.log(`[Scraper] Navegando a: ${targetUrl}`);
+    const combos = filters ? expandFilterCombos(filters) : [null];
+    let totalPagesProcessed = 0;
+    let succeededPasses = 0;
+    const passErrors = [];
+    const navOpts = {
+      navigationRetries: options.navigationRetries,
+      retryDelayMs: options.retryDelayMs
+    };
 
-    await page.goto(targetUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 45000
-    });
-
-    // Dismiss Didomi Cookie Banner if present
-    await dismissCookieBanner(page);
-
-    if (filters && (filters.cabin || filters.nights)) {
-      await applySearchFiltersOnPage(page, filters);
-    }
-
-    let hasNextPage = true;
-
-    while (hasNextPage && currentPage <= maxPages) {
-      console.log(`[Scraper] Procesando página ${currentPage}...`);
-
-      // Wait for hydrated cruise cards (ignoring skeleton placeholders) or no-results banner
+    for (const spec of combos) {
+      const searchDates = spec ? resolveSearchDates(spec) : calculateDepartureDates();
+      const targetUrl = options.customUrl || buildSearchUrl(searchDates, 1, spec);
       try {
-        await page.waitForSelector(".cruise-card:not(.tw-animate-pulse), .no-results-banner", {
-          timeout: 15000
-        });
-      } catch (_) {}
-
-      // Extract raw cruise data from DOM
-      const pageCruises = await page.evaluate(extractCruisesFromDOM, currentPage);
-
-      // Normalize prices and apply tripType filter
-      const activeCabinLabel = filters && filters.cabin ? String(filters.cabin).trim() : "Todas";
-      const tripTypeFilter = filters && filters.tripType ? String(filters.tripType).trim() : "";
-      for (const item of pageCruises) {
-        if (tripTypeFilter === "roundtrip" && item.solo_ida) continue;
-        if (tripTypeFilter === "oneway" && !item.solo_ida) continue;
-        const parsedPrice = parsePrice(item.rawPrice);
-        delete item.rawPrice;
-        item.precio = parsedPrice;
-        item.camarote = activeCabinLabel;
-        item.tipo_viaje = item.solo_ida ? "Solo ida" : "Ida y vuelta";
-        allCruceros.push(item);
-      }
-
-      console.log(`[Scraper] ${pageCruises.length} cruceros encontrados en página ${currentPage} (Total: ${allCruceros.length})`);
-
-      // Check pagination boundary
-      if (currentPage >= maxPages) {
-        hasNextPage = false;
-        break;
-      }
-
-      // Check if next page exists and is enabled
-      const canPaginate = await page.evaluate(() => {
-        const nextItem = document.querySelector("li.right-arrow");
-        if (!nextItem) return false;
-
-        if (nextItem.classList.contains("disabled") ||
-            nextItem.classList.contains("disabled-dots") ||
-            nextItem.getAttribute("aria-disabled") === "true") {
-          return false;
-        }
-
-        const style = window.getComputedStyle(nextItem);
-        if (style.display === "none" || style.visibility === "hidden") {
-          return false;
-        }
-
-        const pageNumbers = Array.from(document.querySelectorAll("li.number"));
-        if (pageNumbers.length > 0) {
-          const lastNumber = pageNumbers[pageNumbers.length - 1];
-          if (lastNumber && lastNumber.classList.contains("active")) {
-            return false;
+        if (!page || (typeof page.isClosed === "function" && page.isClosed())) {
+          if (browser) {
+            try { await browser.close(); } catch (_) {}
           }
+          browser = await launchBrowser({ headless });
+          page = await setupPage(browser);
         }
-
-        return !!nextItem.querySelector("a");
-      });
-
-      if (!canPaginate) {
-        hasNextPage = false;
-        break;
-      }
-
-      // Capture state before click for reactive transition synchronization
-      const previousState = await page.evaluate(() => {
-        const activeEl = document.querySelector("li.number.active");
-        const activePage = activeEl ? activeEl.textContent.trim() : "";
-        const counterEl = document.querySelector(".pagination-wrp__counter");
-        const counterText = counterEl ? counterEl.textContent.trim() : "";
-        return { activePage, counterText };
-      });
-
-      try {
-        await page.evaluate(() => {
-          const link = document.querySelector("li.right-arrow a");
-          if (link) link.scrollIntoView({ behavior: "smooth", block: "center" });
-        });
-        await new Promise(r => setTimeout(r, 200));
-        await page.click("li.right-arrow a");
-
-        // Await reactive Vue DOM change
-        await page.waitForFunction(
-          (prev) => {
-            const currActiveEl = document.querySelector("li.number.active");
-            const currActive = currActiveEl ? currActiveEl.textContent.trim() : "";
-            if (currActive && currActive !== prev.activePage) return true;
-
-            const currCounterEl = document.querySelector(".pagination-wrp__counter");
-            const currCounter = currCounterEl ? currCounterEl.textContent.trim() : "";
-            if (currCounter && currCounter !== prev.counterText) return true;
-
-            return false;
-          },
-          { timeout: 15000 },
-          previousState
-        );
-
-        await new Promise(r => setTimeout(r, 1000));
-        currentPage++;
-      } catch (paginationError) {
-        console.warn(`[Scraper] Transición de paginación falló o finalizó en página ${currentPage}: ${paginationError.message}`);
-        hasNextPage = false;
-        break;
+        const passRes = await scrapeSearchPass(page, targetUrl, spec, maxPages, navOpts);
+        allCruceros.push(...passRes.cruceros);
+        totalPagesProcessed += passRes.pagesProcessed;
+        succeededPasses++;
+      } catch (passErr) {
+        const errorCode = isConnectionRefusedError(passErr) ? "ECONNREFUSED" : (passErr.code || "SCRAPE_ERROR");
+        passErrors.push({ spec, targetUrl, error: formatNetworkError(passErr, targetUrl), errorCode, rawError: passErr });
+        console.warn(`[Scraper Pass Error] Falló pase (${spec?.cabin || "default"}): ${passErr.message}`);
       }
     }
+
+    if (succeededPasses === 0 && passErrors.length > 0) {
+      const firstErr = passErrors[0];
+      const aggErr = new Error(firstErr.error);
+      aggErr.code = firstErr.errorCode;
+      aggErr.skipScreenshot = isConnectionRefusedError(firstErr.rawError);
+      throw aggErr;
+    }
+
+    currentPage = Math.max(1, totalPagesProcessed);
 
     // Serialize JSON Output
     const jsonOutput = {
       total_cruceros: allCruceros.length,
       paginas_procesadas: currentPage,
       fecha_scraping: new Date().toISOString(),
+      partial_errors: passErrors.length > 0 ? passErrors.map(({ rawError, ...rest }) => rest) : undefined,
       cruceros: allCruceros
     };
     await fs.promises.writeFile(resolvedJsonPath, JSON.stringify(jsonOutput, null, 2), "utf-8");
@@ -922,12 +1079,13 @@ async function createFile(options = {}) {
       totalCruceros: allCruceros.length,
       xlsxPath: resolvedXlsxPath,
       jsonPath: resolvedJsonPath,
-      cruceros: allCruceros
+      cruceros: allCruceros,
+      partialErrors: passErrors.length > 0 ? passErrors.map(({ rawError, ...rest }) => rest) : undefined
     };
   } catch (error) {
     console.error("[Scraper Error]:", error.message);
 
-    if (page) {
+    if (page && !error.skipScreenshot && !isConnectionRefusedError(error)) {
       try {
         await page.screenshot({ path: path.resolve(process.cwd(), "error-screenshot.png"), fullPage: true });
       } catch (_) {}
@@ -957,6 +1115,7 @@ async function createFile(options = {}) {
       xlsxPath: resolvedXlsxPath,
       jsonPath: resolvedJsonPath,
       cruceros: allCruceros,
+      errorCode: isConnectionRefusedError(error) ? "ECONNREFUSED" : (error.code || "SCRAPER_ERROR"),
       error: error.message
     };
   } finally {
@@ -974,12 +1133,16 @@ createFile.createExcelReport = createExcelReport;
 createFile.calculateDepartureDates = calculateDepartureDates;
 createFile.resolveSearchDates = resolveSearchDates;
 createFile.buildSearchUrl = buildSearchUrl;
+createFile.expandFilterCombos = expandFilterCombos;
 createFile.discoverPromoLinks = discoverPromoLinks;
 createFile.SUBCATEGORY_URLS = SUBCATEGORY_URLS;
 createFile.applySearchFiltersOnPage = applySearchFiltersOnPage;
 createFile.dismissCookieBanner = dismissCookieBanner;
 createFile.launchBrowser = launchBrowser;
 createFile.setupPage = setupPage;
+createFile.navigateWithRetry = navigateWithRetry;
+createFile.isTransientNetworkError = isTransientNetworkError;
+createFile.isConnectionRefusedError = isConnectionRefusedError;
 createFile.parsePrice = parsePrice;
 createFile.parsePriceString = parsePrice;
 createFile.HEADERS = HEADERS;
