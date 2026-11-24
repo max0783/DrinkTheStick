@@ -5,13 +5,20 @@ const path = require('path');
 const os = require('os');
 const TelegramBot = require('node-telegram-bot-api');
 const schedule = require('node-schedule');
+const ExcelJS = require('exceljs');
 const createFile = require('./msc_scrapper_excel');
+const createCostaFile = require('./costa_scrapper_excel');
 
 const DEFAULT_CRON = '*/15 * * * *';
 const DEFAULT_MAX_OFFER_PRICE = 800;
 const DEFAULT_MAX_PAGES = Number(process.env.MAX_PAGES) > 0 ? Number(process.env.MAX_PAGES) : 5;
 
 const FILTER_OPTIONS = {
+  companies: [
+    { code: 'ALL', value: '', label: '🚢 Todas (MSC + Costa)' },
+    { code: 'MSC', value: 'MSC', label: '🔵 Solo MSC' },
+    { code: 'COSTA', value: 'COSTA', label: '🟡 Solo Costa' }
+  ],
   subcategories: [
     { code: 'ALL', value: '', label: '🌐 Buscador global' },
     { code: 'BF', value: 'black-friday', label: '🔥 Black Friday' },
@@ -260,6 +267,7 @@ function getMaxOfferPrice(overridePrice) {
 
 function getDefaultFilters(overrideMaxPrice) {
   return {
+    company: '',
     subcategory: '',
     tripType: '',
     area: 'SOA',
@@ -277,6 +285,7 @@ function normalizeFilters(raw = {}, overrideMaxPrice) {
   const defaults = getDefaultFilters(overrideMaxPrice);
   const src = raw && typeof raw === 'object' ? raw : {};
 
+  const validCompanies = new Set(FILTER_OPTIONS.companies.map(getOptionValue));
   const validSubcategories = new Set(FILTER_OPTIONS.subcategories.map(getOptionValue).filter(Boolean));
   const validTripTypes = new Set(FILTER_OPTIONS.tripTypes.map(getOptionValue));
   const validAreas = new Set(FILTER_OPTIONS.areas.map(getOptionValue).filter(Boolean));
@@ -285,6 +294,9 @@ function normalizeFilters(raw = {}, overrideMaxPrice) {
   const validCabins = new Set(FILTER_OPTIONS.cabins.map(getOptionValue).filter(Boolean));
   const validNights = new Set(FILTER_OPTIONS.nights.map(getOptionValue).filter(Boolean));
 
+  const company = src.company !== undefined && validCompanies.has(String(src.company))
+    ? String(src.company)
+    : defaults.company;
   const subcategory = src.subcategory !== undefined
     ? parseMultiValues(src.subcategory, validSubcategories, true).join(',')
     : defaults.subcategory;
@@ -328,6 +340,7 @@ function normalizeFilters(raw = {}, overrideMaxPrice) {
   }
 
   return {
+    company,
     subcategory,
     tripType,
     area,
@@ -344,6 +357,7 @@ function normalizeFilters(raw = {}, overrideMaxPrice) {
 function getSearchFilterKey(filters) {
   const f = normalizeFilters(filters);
   return [
+    f.company,
     f.subcategory,
     f.tripType,
     f.area,
@@ -480,26 +494,51 @@ function getOfferDatesText(offer) {
   return String(offer?.fechas || '');
 }
 
+function normalizeCostaCompoundId(rawId) {
+  const id = String(rawId || '').trim();
+  const match = id.match(/^([A-Z0-9]+)_[A-Z0-9]+$/i);
+  return match ? match[1] : id;
+}
+
 function extractCruiseId(offerOrUrl) {
   if (offerOrUrl && typeof offerOrUrl === 'object') {
-    if (offerOrUrl.cruiseId) return String(offerOrUrl.cruiseId).trim();
     const candidateUrl = offerOrUrl.url || offerOrUrl.url_itinerario || '';
+    const isCostaObj = Boolean(
+      (offerOrUrl.compania && String(offerOrUrl.compania).toLowerCase().includes('costa')) ||
+      (offerOrUrl.barco && String(offerOrUrl.barco).toLowerCase().startsWith('costa')) ||
+      String(candidateUrl).includes('costacruceros.com')
+    );
+    if (offerOrUrl.cruiseId) {
+      const rawId = String(offerOrUrl.cruiseId).trim();
+      return isCostaObj ? normalizeCostaCompoundId(rawId) : rawId;
+    }
     return extractCruiseId(candidateUrl);
   }
   const urlStr = String(offerOrUrl || '').trim();
   if (!urlStr) return '';
   const match = urlStr.match(/[?&]cruiseId=([^&#]+)/i);
-  if (!match) return '';
-  try {
-    return decodeURIComponent(match[1]).trim();
-  } catch (_) {
-    return match[1].trim();
+  if (match) {
+    try {
+      return decodeURIComponent(match[1]).trim();
+    } catch (_) {
+      return match[1].trim();
+    }
   }
+  const matchCosta = urlStr.match(/\/cruises\/[^/]+\/([^./]+)\.html/i);
+  if (matchCosta) {
+    const rawId = matchCosta[1].trim();
+    return urlStr.includes('costacruceros.com') ? normalizeCostaCompoundId(rawId) : rawId;
+  }
+  return '';
 }
 
 function normalizeItineraryUrl(rawUrl) {
   const urlStr = String(rawUrl || '').trim();
   if (!urlStr) return '';
+
+  if (urlStr.includes('costacruceros.com')) {
+    return urlStr.replace(/(\/cruises\/([^/]+)\/[^/_]+)_\2\.html/i, '$1.html');
+  }
 
   const cruiseId = extractCruiseId(urlStr);
   if (cruiseId && !/\/booking\b/i.test(urlStr)) {
@@ -509,7 +548,13 @@ function normalizeItineraryUrl(rawUrl) {
 }
 
 function isSameCruiseVariant(a, b) {
-  if (String(a?.camarote || 'Todas') !== String(b?.camarote || 'Todas')) return false;
+  const cabA = String(a?.camarote || 'Todas').trim().toLowerCase();
+  const cabB = String(b?.camarote || 'Todas').trim().toLowerCase();
+  if (cabA !== cabB) return false;
+
+  const compA = a?.compania || (a?.barco && a.barco.toLowerCase().startsWith('costa') ? 'Costa Cruceros' : 'MSC Cruceros');
+  const compB = b?.compania || (b?.barco && b.barco.toLowerCase().startsWith('costa') ? 'Costa Cruceros' : 'MSC Cruceros');
+  if (compA !== compB) return false;
 
   const idA = extractCruiseId(a);
   const idB = extractCruiseId(b);
@@ -577,6 +622,7 @@ function formatFilterSummary(filters) {
 
   return (
     `🎛 Tus filtros actuales:\n` +
+    `• Naviera: ${findFilterLabel(FILTER_OPTIONS.companies, f.company)}\n` +
     `• Subcategoría: ${formatMultiFilterLabel(FILTER_OPTIONS.subcategories, f.subcategory)}\n` +
     `• Tipo de viaje: ${findFilterLabel(FILTER_OPTIONS.tripTypes, f.tripType)}\n` +
     `${areaLine}\n` +
@@ -590,6 +636,7 @@ function formatFilterSummary(filters) {
 function formatShortFilterCaption(filters) {
   const f = normalizeFilters(filters);
   const stripIcon = (txt) => txt.replace(/^[^\s]+\s/, '');
+  const compLabel = f.company ? stripIcon(findFilterLabel(FILTER_OPTIONS.companies, f.company)) : 'MSC y Costa';
   const subLabel = parseMultiValues(f.subcategory, null, true)
     .map((v) => stripIcon(findFilterLabel(FILTER_OPTIONS.subcategories, v)))
     .join(', ') || 'Buscador global';
@@ -600,6 +647,7 @@ function formatShortFilterCaption(filters) {
         parseMultiValues(f.embkPort).map((v) => stripIcon(findFilterLabel(FILTER_OPTIONS.ports, v))).join(', ') || 'Cualquiera'
       ];
   const parts = [
+    compLabel,
     ...scopeParts,
     f.tripType ? stripIcon(findFilterLabel(FILTER_OPTIONS.tripTypes, f.tripType)) : 'Ida/Vuelta y Solo ida',
     f.cabin || 'Todas las cabinas',
@@ -619,6 +667,14 @@ function chunkButtons(buttons, size = 2) {
 function buildFilterKeyboard(filters, submenu = 'main') {
   const f = normalizeFilters(filters);
   const btn = (text, callback_data) => ({ text, callback_data });
+
+  if (submenu === 'cmp') {
+    const items = FILTER_OPTIONS.companies.map((opt) => {
+      const prefix = f.company === opt.value ? '✅ ' : '';
+      return btn(`${prefix}${opt.label}`, `flt:cmp:${opt.code}`);
+    });
+    return { inline_keyboard: [...chunkButtons(items, 1), [btn('⬅️ Volver', 'flt:menu')]] };
+  }
 
   if (MULTI_FILTER_META[submenu]) {
     const meta = MULTI_FILTER_META[submenu];
@@ -664,10 +720,11 @@ function buildFilterKeyboard(filters, submenu = 'main') {
 
   return {
     inline_keyboard: [
-      [btn('🏷 Subcategoría / Promo', 'flt:open:sub'), btn('🔁 Tipo de viaje', 'flt:open:trip')],
+      [btn('🚢 Naviera', 'flt:open:cmp'), btn('🏷 Subcategoría / Promo', 'flt:open:sub')],
+      [btn('🔁 Tipo de viaje', 'flt:open:trip'), btn('💰 Precio máx.', 'flt:open:prc')],
       [btn('🗺 Destino (hacia)', 'flt:open:area'), btn('⚓ Salida (desde)', 'flt:open:port')],
       [btn('📅 Fechas', 'flt:open:date'), btn('🛏 Camarote', 'flt:open:cab')],
-      [btn('🌙 Noches', 'flt:open:dur'), btn('💰 Precio máx.', 'flt:open:prc')],
+      [btn('🌙 Noches', 'flt:open:dur')],
       [btn('📊 Buscar (Excel)', 'flt:run'), btn('🔄 Restablecer', 'flt:reset')]
     ]
   };
@@ -710,6 +767,152 @@ function parseManualPrice(text) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+async function createConsolidatedExcelReport(cruises = [], outputPath = 'cruceros_msc.xlsx') {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'DrinkTheStick Bot';
+  workbook.lastModifiedBy = 'DrinkTheStick Bot';
+  workbook.created = new Date();
+  workbook.modified = new Date();
+
+  const isCostaCruise = (c) =>
+    Boolean((c?.compania && String(c.compania).toLowerCase().includes('costa')) ||
+    (c?.barco && String(c.barco).toLowerCase().startsWith('costa')));
+
+  const mscCruises = cruises.filter((c) => !isCostaCruise(c));
+  const costaCruises = cruises.filter(isCostaCruise);
+
+  if (mscCruises.length > 0 && costaCruises.length > 0) {
+    const wsAll = workbook.addWorksheet('Todos los Cruceros', { views: [{ showGridLines: true }] });
+    wsAll.columns = [
+      { header: 'Compañía', key: 'compania', width: 16 },
+      { header: 'Destino', key: 'destino', width: 22 },
+      { header: 'Duración', key: 'duracion', width: 18 },
+      { header: 'Barco', key: 'barco', width: 20 },
+      { header: 'Puerto de Salida', key: 'puerto_salida', width: 28 },
+      { header: 'Moneda', key: 'moneda', width: 10 },
+      { header: 'Precio', key: 'precio', width: 14 },
+      { header: 'Fechas Disponibles', key: 'fechas_disponibles', width: 35 },
+      { header: 'Promoción', key: 'promocion', width: 20 },
+      { header: 'URL Itinerario', key: 'url_itinerario', width: 50 },
+      { header: 'Página', key: 'pagina', width: 10 },
+      { header: 'Camarote', key: 'camarote', width: 20 }
+    ];
+
+    const hRowAll = wsAll.getRow(1);
+    hRowAll.height = 24;
+    hRowAll.eachCell((cell) => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E293B' } };
+      cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
+    });
+
+    const sortedAll = [...cruises].sort((a, b) => (getOfferPrice(a) || 0) - (getOfferPrice(b) || 0));
+    sortedAll.forEach((c) => {
+      const fechasText = getOfferDatesText(c);
+      const precioVal = getOfferPrice(c) || 0;
+      const row = wsAll.addRow({
+        compania: c.compania || (isCostaCruise(c) ? 'Costa Cruceros' : 'MSC Cruceros'),
+        destino: c.destino || '',
+        duracion: c.duracion || '',
+        barco: c.barco || '',
+        puerto_salida: c.puerto_salida || c.puerto || '',
+        moneda: c.moneda || c.precio?.moneda || 'USD',
+        precio: precioVal,
+        fechas_disponibles: fechasText,
+        promocion: c.promocion || 'N/A',
+        url_itinerario: c.url_itinerario || c.url || '',
+        pagina: c.pagina || 1,
+        camarote: c.camarote || 'Todas'
+      });
+      row.height = 20;
+      row.getCell(7).numFmt = '$#,##0';
+    });
+  }
+
+  const wsMsc = workbook.addWorksheet('Cruceros MSC', { views: [{ showGridLines: true }] });
+  wsMsc.columns = [
+    { header: 'Destino', key: 'destino', width: 20 },
+    { header: 'Duración', key: 'duracion', width: 14 },
+    { header: 'Barco', key: 'barco', width: 20 },
+    { header: 'Puerto de Salida', key: 'puerto_salida', width: 28 },
+    { header: 'Moneda', key: 'moneda', width: 10 },
+    { header: 'Precio', key: 'precio', width: 14 },
+    { header: 'Fechas Disponibles', key: 'fechas_disponibles', width: 45 },
+    { header: 'Promoción', key: 'promocion', width: 25 },
+    { header: 'URL Itinerario', key: 'url_itinerario', width: 55 },
+    { header: 'Página', key: 'pagina', width: 10 },
+    { header: 'Camarote', key: 'camarote', width: 20 }
+  ];
+  const hRowMsc = wsMsc.getRow(1);
+  hRowMsc.height = 24;
+  hRowMsc.eachCell((cell) => {
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF002B49' } };
+    cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+    cell.alignment = { vertical: 'middle', horizontal: 'center' };
+  });
+  mscCruises.forEach((c) => {
+    const row = wsMsc.addRow({
+      destino: c.destino || '',
+      duracion: c.duracion || '',
+      barco: c.barco || '',
+      puerto_salida: c.puerto_salida || c.puerto || '',
+      moneda: c.moneda || c.precio?.moneda || 'USD',
+      precio: getOfferPrice(c) || 0,
+      fechas_disponibles: getOfferDatesText(c),
+      promocion: c.promocion || 'N/A',
+      url_itinerario: c.url_itinerario || c.url || '',
+      pagina: c.pagina || 1,
+      camarote: c.camarote || 'Todas'
+    });
+    row.height = 20;
+    row.getCell(6).numFmt = '#,##0';
+  });
+
+  if (costaCruises.length > 0) {
+    const wsCosta = workbook.addWorksheet('Cruceros Costa', { views: [{ showGridLines: true }] });
+    wsCosta.columns = [
+      { header: 'Destino', key: 'destino', width: 22 },
+      { header: 'Duración', key: 'duracion', width: 18 },
+      { header: 'Barco', key: 'barco', width: 20 },
+      { header: 'Puerto de Salida', key: 'puerto_salida', width: 28 },
+      { header: 'Moneda', key: 'moneda', width: 10 },
+      { header: 'Precio', key: 'precio', width: 14 },
+      { header: 'Fechas Disponibles', key: 'fechas_disponibles', width: 35 },
+      { header: 'Promoción', key: 'promocion', width: 20 },
+      { header: 'URL Itinerario', key: 'url_itinerario', width: 50 },
+      { header: 'Página', key: 'pagina', width: 10 },
+      { header: 'Camarote', key: 'camarote', width: 20 }
+    ];
+    const hRowCosta = wsCosta.getRow(1);
+    hRowCosta.height = 24;
+    hRowCosta.eachCell((cell) => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF003876' } };
+      cell.font = { name: 'Calibri', size: 11, bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
+    });
+    costaCruises.forEach((c) => {
+      const row = wsCosta.addRow({
+        destino: c.destino || '',
+        duracion: c.duracion || '',
+        barco: c.barco || '',
+        puerto_salida: c.puerto_salida || c.puerto || '',
+        moneda: c.moneda || c.precio?.moneda || 'USD',
+        precio: getOfferPrice(c) || 0,
+        fechas_disponibles: getOfferDatesText(c),
+        promocion: c.promocion || 'N/A',
+        url_itinerario: c.url_itinerario || c.url || '',
+        pagina: c.pagina || 1,
+        camarote: c.camarote || 'Interior'
+      });
+      row.height = 20;
+      row.getCell(6).numFmt = '$#,##0';
+    });
+  }
+
+  await workbook.xlsx.writeFile(outputPath);
+  return path.resolve(outputPath);
+}
+
 async function runReportCycle(options = {}) {
   if (isJobRunning) {
     console.warn('[Mutex] Scraper job is already running. Skipping overlapping run.');
@@ -720,7 +923,9 @@ async function runReportCycle(options = {}) {
   const tempFilesToClean = [];
 
   try {
-    const scraper = options.scraperFn || createFile;
+    const isExplicitScraper = Boolean(options.scraperFn);
+    const mscScraper = options.mscScraperFn || (isExplicitScraper ? options.scraperFn : createFile);
+    const costaScraper = options.costaScraperFn || (isExplicitScraper ? null : createCostaFile.createCostaFile);
     const currentBot = options.bot || bot;
     const usersPath = getUsersFilePath(options.usersFilePath);
     const offersPath = getOffersFilePath(options.sentOffersFilePath);
@@ -811,7 +1016,55 @@ async function runReportCycle(options = {}) {
         tempFilesToClean.push(scraperOpts.outputPath, scraperOpts.jsonPath);
       }
 
-      const scrapeResult = await scraper(scraperOpts);
+      const groupCompany = group.filters?.company || '';
+      const shouldRunMsc = !groupCompany || groupCompany === 'MSC';
+      const shouldRunCosta = Boolean(costaScraper && (!groupCompany || groupCompany === 'COSTA'));
+
+      let scrapeResult;
+      if (shouldRunMsc && shouldRunCosta) {
+        let mscRes = null;
+        let costaRes = null;
+        let mscErr = null;
+        let costaErr = null;
+
+        try {
+          mscRes = await mscScraper(scraperOpts);
+        } catch (e) {
+          mscErr = e;
+          console.warn('[ReportCycle Warning]: MSC scrape failed:', e.message);
+        }
+
+        try {
+          costaRes = await costaScraper(scraperOpts);
+        } catch (e) {
+          costaErr = e;
+          console.warn('[ReportCycle Warning]: Costa scrape failed:', e.message);
+        }
+
+        if ((!mscRes || mscRes.success === false) && (!costaRes || costaRes.success === false)) {
+          const err = mscErr || costaErr || new Error((mscRes && mscRes.error) || (costaRes && costaRes.error) || 'Scraping failed');
+          err.code = (mscRes && mscRes.errorCode) || (costaRes && costaRes.errorCode) || 'SCRAPE_ERROR';
+          throw err;
+        }
+
+        const mscCruises = (mscRes?.success !== false && Array.isArray(mscRes?.cruceros)) ? mscRes.cruceros : [];
+        const costaCruises = (costaRes?.success !== false && Array.isArray(costaRes?.cruceros)) ? costaRes.cruceros : [];
+        const combinedCruises = [...mscCruises, ...costaCruises];
+
+        const targetXlsx = scraperOpts.outputPath || path.resolve(process.cwd(), 'cruceros_msc.xlsx');
+        await createConsolidatedExcelReport(combinedCruises, targetXlsx);
+
+        scrapeResult = {
+          success: true,
+          totalCruceros: (mscRes?.totalCruceros || 0) + (costaRes?.totalCruceros || 0),
+          cruceros: combinedCruises,
+          xlsxPath: targetXlsx
+        };
+      } else if (shouldRunCosta && costaScraper) {
+        scrapeResult = await costaScraper(scraperOpts);
+      } else {
+        scrapeResult = await mscScraper(scraperOpts);
+      }
       if (!scrapeResult || scrapeResult.success === false) {
         const err = new Error((scrapeResult && scrapeResult.error) || 'Scraping failed');
         err.code = scrapeResult?.errorCode || 'SCRAPE_ERROR';
@@ -834,6 +1087,7 @@ async function runReportCycle(options = {}) {
         url_itinerario: normalizeItineraryUrl(c.url_itinerario || c.url || '')
       }));
       const rawMappedOffers = normalizedCruises.map((c) => ({
+        compania: c.compania || (c.barco && String(c.barco).toLowerCase().startsWith('costa') ? 'Costa Cruceros' : 'MSC Cruceros'),
         destino: c.destino,
         duracion: c.duracion,
         barco: c.barco,
@@ -899,8 +1153,10 @@ async function runReportCycle(options = {}) {
               continue;
             }
 
+            const compLine = offer.compania ? `🏢 Naviera: ${offer.compania}\n` : '';
             const msg =
               `¡Nueva oferta encontrada!\n\n` +
+              compLine +
               `🚢 Destino: ${offer.destino}\n` +
               `⏱ Duración: ${offer.duracion}\n` +
               `🛳 Barco: ${offer.barco}\n` +
@@ -949,7 +1205,7 @@ async function runReportCycle(options = {}) {
         year: 'numeric'
       });
       const fileOptions = options.fileOptions || {
-        filename: `cruceros_msc_${new Date().toISOString().slice(0, 10)}.xlsx`,
+        filename: `cruceros_ofertas_${new Date().toISOString().slice(0, 10)}.xlsx`,
         contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       };
 
@@ -961,7 +1217,7 @@ async function runReportCycle(options = {}) {
           let docPath = state.groupXlsxPaths[0] || lastXlsxPath;
           if (state.groupXlsxPaths.length > 1) {
             const mergedPath = path.join(os.tmpdir(), `dts_merged_${chatId}_${Date.now()}.xlsx`);
-            await createFile.createExcelReport(state.rawCruises, mergedPath);
+            await createConsolidatedExcelReport(state.rawCruises, mergedPath);
             tempFilesToClean.push(mergedPath);
             docPath = mergedPath;
           }
@@ -970,7 +1226,7 @@ async function runReportCycle(options = {}) {
             ? `\n💰 Con precio ≤ $${maxPrice} USD: ${state.matchingOffers.length}`
             : '';
           const caption = options.caption ||
-            `📊 Reporte MSC Cruceros - ${todayStr}\n🎛 ${formatShortFilterCaption(state.member.filters)}\n🚢 Total encontrados: ${reportCount}${budgetLine}`;
+            `📊 Reporte de Cruceros - ${todayStr}\n🎛 ${formatShortFilterCaption(state.member.filters)}\n🚢 Total encontrados: ${reportCount}${budgetLine}`;
 
           try {
             await callTelegramWithRetry(
@@ -1097,7 +1353,8 @@ async function safeEditMessage(botInstance, chatId, messageId, text, replyMarkup
 }
 
 const SUBMENU_TITLES = {
-  main: '⚙️ Configuración de filtros MSC Cruceros',
+  main: '⚙️ Configuración de filtros de cruceros',
+  cmp: '🚢 Selecciona naviera (Todas, solo MSC o solo Costa):',
   sub: '🏷 Elige una o más subcategorías / promos (o Buscador global para usar Destino y Salida):',
   trip: '🔁 Selecciona tipo de itinerario (Ida y vuelta vs Solo ida):',
   area: '🗺 Destinos (hacia) — puedes elegir dos o más:',
@@ -1164,10 +1421,14 @@ function registerBotHandlers(botInstance, options = {}) {
     const maxPrice = options.maxOfferPrice !== undefined
       ? getMaxOfferPrice(options.maxOfferPrice)
       : userFilters.maxPrice;
+    const targetComp = userFilters.company || '';
     const allSent = loadSentOffers(offersPath);
 
     const activeMatching = allSent.filter((o) => {
       if (o.active === false) return false;
+      const isCosta = Boolean((o.compania && String(o.compania).toLowerCase().includes('costa')) || (o.barco && String(o.barco).toLowerCase().startsWith('costa')));
+      if (targetComp === 'MSC' && isCosta) return false;
+      if (targetComp === 'COSTA' && !isCosta) return false;
       if (maxPrice > 0) {
         const p = getOfferPrice(o);
         return Number.isFinite(p) && p > 0 && p <= maxPrice;
@@ -1210,9 +1471,10 @@ function registerBotHandlers(botInstance, options = {}) {
       const cabin = offer.camarote || 'Todas';
       const datesText = getOfferDatesText(offer);
       const link = normalizeItineraryUrl(offer.url || offer.url_itinerario || '');
+      const compTag = offer.compania || (offer.barco && String(offer.barco).toLowerCase().startsWith('costa') ? 'Costa Cruceros' : 'MSC Cruceros');
 
       const block =
-        `${index + 1}. ${offer.destino}\n` +
+        `${index + 1}. [${compTag}] ${offer.destino}\n` +
         `   💰 Precio: ${priceVal} ${cur}\n` +
         `   ⏱ Duración: ${offer.duracion} | 🛏 ${cabin}\n` +
         `   🛳 Barco: ${offer.barco}\n` +
@@ -1528,6 +1790,15 @@ function registerBotHandlers(botInstance, options = {}) {
         return;
       }
 
+      if (action === 'cmp') {
+        const opt = FILTER_OPTIONS.companies.find((c) => c.code === value);
+        const company = opt ? opt.value : '';
+        updateUserFilters(chatId, { company }, usersPath);
+        await safeAnswerCallback(botInstance, query.id, `Naviera: ${opt ? opt.label : 'Todas'}`);
+        await sendFilterMenu(chatId, messageId, 'main');
+        return;
+      }
+
       if (action === 'trip') {
         const opt = FILTER_OPTIONS.tripTypes.find((t) => t.code === value);
         const tripType = opt ? opt.value : '';
@@ -1747,6 +2018,8 @@ module.exports = {
   initBot,
   registerBotHandlers,
   runReportCycle,
+  createConsolidatedExcelReport,
+  createCostaFile,
   startScheduler,
   stopScheduler,
   gracefulShutdown,

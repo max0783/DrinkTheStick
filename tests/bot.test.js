@@ -597,6 +597,7 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
 
     const saved = app.getUserFilters(999888440, usersFile);
     assert.deepStrictEqual(saved, {
+      company: '',
       subcategory: '',
       tripType: 'roundtrip',
       area: 'CAR',
@@ -829,5 +830,163 @@ describe('Telegram Bot & Multi-User Subscription Flow (app.js)', () => {
     await new Promise((r) => setTimeout(r, 60));
     assert.strictEqual(pollStops, 1);
     assert.strictEqual(pollStarts, 1);
+  });
+
+  it('supports Costa Cruceros and multi-company filtering, alerts, and consolidated Excel reports', async () => {
+    const mockBot = createMockBot();
+    const mscMock = async () => ({
+      success: true,
+      totalCruceros: 1,
+      cruceros: [
+        {
+          compania: 'MSC Cruceros',
+          destino: 'Sudamérica',
+          duracion: '8 Noches',
+          barco: 'MSC Splendida',
+          puerto_salida: 'Buenos Aires',
+          precio: { moneda: 'USD', valor: 750 },
+          fechas_disponibles: ['03 Dic 2026'],
+          url_itinerario: 'https://www.msccruceros.com.ar/booking?cruiseId=SP01&adults=2&children=0&infants=0&juniors=0',
+          pagina: 1
+        }
+      ]
+    });
+
+    app.registerBotHandlers(mockBot, {
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      scraperFn: mscMock,
+      maxOfferPrice: 1000
+    });
+
+    // 1. User configures company filter via inline buttons
+    await mockBot.simulateText(777888, '/start');
+    const startMsg = mockBot.sentMessages.find((m) => m.chatId === 777888);
+    await mockBot.simulateCallback(777888, 'flt:open:cmp', startMsg.message_id);
+    const cmpKeyboard = mockBot.editedMessages.at(-1).options.reply_markup.inline_keyboard.flat();
+    assert.ok(cmpKeyboard.some((b) => b.callback_data === 'flt:cmp:COSTA'));
+    assert.ok(cmpKeyboard.some((b) => b.callback_data === 'flt:cmp:MSC'));
+    assert.ok(cmpKeyboard.some((b) => b.callback_data === 'flt:cmp:ALL'));
+
+    // Select Costa only
+    await mockBot.simulateCallback(777888, 'flt:cmp:COSTA', startMsg.message_id);
+    assert.strictEqual(app.getUserFilters(777888, usersFile).company, 'COSTA');
+
+    // Reset back to All companies
+    await mockBot.simulateCallback(777888, 'flt:cmp:ALL', startMsg.message_id);
+    assert.strictEqual(app.getUserFilters(777888, usersFile).company, '');
+
+    // 2. Multi-company run with MSC and Costa scrapers
+    const costaMock = async () => ({
+      success: true,
+      totalCruceros: 1,
+      cruceros: [
+        {
+          compania: 'Costa Cruceros',
+          destino: 'América Del Sur',
+          duracion: '4 días (3 noches)',
+          barco: 'Costa Serena',
+          puerto_salida: 'Buenos Aires',
+          precio: { moneda: 'USD', valor: 306 },
+          fechas_disponibles: ['16/03/2027'],
+          url_itinerario: 'https://www.costacruceros.com/cruises/BUE03A14/SE03270316.html',
+          pagina: 1
+        }
+      ]
+    });
+
+    assert.strictEqual(
+      app.normalizeItineraryUrl('https://www.costacruceros.com/cruises/BUE01A05/SE01261227_BUE01A05.html'),
+      'https://www.costacruceros.com/cruises/BUE01A05/SE01261227.html'
+    );
+
+    const cycleRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      mscScraperFn: mscMock,
+      costaScraperFn: costaMock,
+      sendDocument: true
+    });
+
+    assert.strictEqual(cycleRes.success, true);
+    assert.strictEqual(cycleRes.totalCruceros, 2);
+    assert.strictEqual(cycleRes.offersSent, 1);
+
+    // Verify alert messages contain naviera line
+    const costaAlert = mockBot.sentMessages.find((m) => m.text.includes('Costa Serena'));
+    assert.ok(costaAlert);
+    assert.ok(costaAlert.text.includes('🏢 Naviera: Costa Cruceros'));
+
+    const mscAlert = mockBot.sentMessages.find((m) => m.text.includes('MSC Splendida'));
+    assert.ok(mscAlert);
+    assert.ok(mscAlert.text.includes('🏢 Naviera: MSC Cruceros'));
+
+    // Verify /offers lists both with tags
+    await mockBot.simulateText(777888, '/offers');
+    const offersMsg = mockBot.sentMessages.at(-1);
+    assert.ok(offersMsg.text.includes('[Costa Cruceros]'));
+    assert.ok(offersMsg.text.includes('[MSC Cruceros]'));
+
+    // 3. Costa deduplication parity: legacy ID, cabin casing, higher price -> 0 alerts; price drop -> 1 alert
+    const costaSameOrHigherMock = async () => ({
+      success: true,
+      totalCruceros: 1,
+      cruceros: [
+        {
+          compania: 'Costa Cruceros',
+          destino: 'América Del Sur',
+          duracion: '4 días (3 noches)',
+          barco: 'Costa Serena',
+          puerto_salida: 'Buenos Aires',
+          precio: { moneda: 'USD', valor: 350 },
+          fechas_disponibles: ['16/03/2027'],
+          camarote: '  todas ',
+          url_itinerario: 'https://www.costacruceros.com/cruises/BUE03A14/SE03270316_BUE03A14.html',
+          cruiseId: 'SE03270316_BUE03A14',
+          pagina: 1
+        }
+      ]
+    });
+
+    const dupCycleRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      mscScraperFn: mscMock,
+      costaScraperFn: costaSameOrHigherMock,
+      sendDocument: false
+    });
+    assert.strictEqual(dupCycleRes.success, true);
+    assert.strictEqual(dupCycleRes.offersSent, 0);
+
+    const costaDropMock = async () => ({
+      success: true,
+      totalCruceros: 1,
+      cruceros: [
+        {
+          compania: 'Costa Cruceros',
+          destino: 'América Del Sur',
+          duracion: '4 días (3 noches)',
+          barco: 'Costa Serena',
+          puerto_salida: 'Buenos Aires',
+          precio: { moneda: 'USD', valor: 280 },
+          fechas_disponibles: ['16/03/2027'],
+          url_itinerario: 'https://www.costacruceros.com/cruises/BUE03A14/SE03270316.html',
+          pagina: 1
+        }
+      ]
+    });
+
+    const dropCycleRes = await app.runReportCycle({
+      bot: mockBot,
+      usersFilePath: usersFile,
+      sentOffersFilePath: offersFile,
+      mscScraperFn: mscMock,
+      costaScraperFn: costaDropMock,
+      sendDocument: false
+    });
+    assert.strictEqual(dropCycleRes.success, true);
+    assert.strictEqual(dropCycleRes.offersSent, 1);
   });
 });
